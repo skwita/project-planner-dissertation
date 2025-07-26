@@ -1,0 +1,51 @@
+from collections import defaultdict
+
+def build_schedule(tasks, percentile, seed=None):
+    # Сэмплируем длительности
+    for task in tasks:
+        task.sample_durations(percentile, seed)
+
+    task_map = {t.task_id: t for t in tasks}
+    role_ready_times = defaultdict(float)  # когда ресурс будет свободен (по факту выполнения)
+
+    scheduled = set()
+
+    while len(scheduled) < len(tasks):
+        progress = False
+        for task in tasks:
+            if task.task_id in scheduled:
+                continue
+
+            # Проверяем, все ли предшественники уже запланированы
+            if not all(dep in scheduled for dep in task.dependencies):
+                continue
+
+            # Зависимость: ждем реального завершения всех предшественников
+            latest_dependency_end = max(
+                [
+                    max(
+                        task_map[dep].start_time + task_map[dep].planned_duration,
+                        task_map[dep].start_time + task_map[dep].real_duration
+                    )
+                    for dep in task.dependencies
+                ],
+                default=0
+            )
+
+            # Ресурс (роль) тоже должен быть свободен после выполнения предыдущей задачи этой роли
+            resource_ready = role_ready_times[task.role]
+
+            # Старт задачи — максимум из зависимостей и готовности ресурса
+            task.start_time = max(latest_dependency_end, resource_ready)
+            task.end_time = task.start_time + task.planned_duration
+
+            # Обновляем, когда исполнитель будет свободен (после фактического выполнения)
+            role_ready_times[task.role] = task.start_time + max(task.planned_duration, task.real_duration)
+
+            scheduled.add(task.task_id)
+            progress = True
+
+        if not progress:
+            raise RuntimeError("Обнаружены циклические зависимости или ошибка в данных.")
+
+    return tasks
