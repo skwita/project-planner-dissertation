@@ -10,12 +10,13 @@ def export_schedule_to_excel(tasks, filename, project_duration, idle_time=None):
             "Роль": task.role,
             "Предшественники": ", ".join(map(str, task.dependencies)) if task.dependencies else "",
             "Ожидаемое ср.время": task.mean,
-            "Ожидаемая дисперсия": task.stddev,
-            "Запланированное время": round(task.planned_duration, 2),
-            "Фактическое время": round(task.real_duration, 2),
-            "Начало": round(task.start_time, 2),
-            "Плановое окончание": round(task.start_time + task.planned_duration, 2),
-            "Реальное окончание": round(task.start_time + task.real_duration, 2)
+            "Абсолютное отклонение": task.stddev,
+            "Запланированное начало":round(task.planned_start_time, 2),
+            "Запланированная длительность":round(task.planned_duration, 2),
+            "Запланированный конец":round(task.planned_end_time, 2),
+            "Фактическое начало":round(task.real_start_time, 2),
+            "Фактическая длительность":round(task.real_duration, 2),
+            "Фактический конец":round(task.real_end_time, 2)
         })
 
     df_schedule = pd.DataFrame(data)
