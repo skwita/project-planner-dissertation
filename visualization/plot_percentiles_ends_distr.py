@@ -1,27 +1,9 @@
-# import matplotlib.pyplot as plt
-
-# def plot_percentile_distributions(durations, percentile, filename):
-#     plt.figure(figsize=(12, 8))
-    
-#     plt.hist(durations, bins=200, range=(0, 200), density=True)
-    
-#     plt.title('Распределение длительности проекта по процентилям')
-#     plt.xlabel('Длительность проекта (дни)')
-#     plt.ylabel('Плотность вероятности')
-#     plt.title(f'Процентиль: {percentile}')
-#     plt.grid(True)
-#     plt.tight_layout()
-    
-#     # Сохраняем график
-#     plt.savefig(filename)
-#     plt.close()
-
 import matplotlib.pyplot as plt
 import numpy as np
 from scipy.stats import gaussian_kde
 import matplotlib.patheffects as pe
 
-def plot_percentile_distributions(durations_list, labels, filename, bins=40, xlim=(40, 80)):
+def plot_percentile_pdf(durations_list, labels, filename, bins=40, xlim=(40, 80)):
     """
     Рисует распределения длительности проекта для нескольких наборов данных:
     - гистограмма (фон)
@@ -60,5 +42,39 @@ def plot_percentile_distributions(durations_list, labels, filename, bins=40, xli
     plt.grid(True, linestyle="--", alpha=0.7)
     plt.tight_layout()
     
+    plt.savefig(filename, dpi=300)
+    plt.close()
+
+
+def plot_percentile_cdfs(durations_list, labels, filename, xlim=None):
+    """
+    Рисует CDF (накопленные распределения) для нескольких наборов данных.
+
+    :param durations_list: список массивов с длительностями (например, [dur1, dur2, dur3])
+    :param labels: список подписей (например, ["p=50%", "p=70%", "p=90%"])
+    :param filename: путь для сохранения графика
+    :param xlim: диапазон по оси X (tuple или None)
+    """
+    plt.figure(figsize=(12, 8))
+
+    colors = ["skyblue", "orange", "green", "red", "purple"]
+
+    for i, durations in enumerate(durations_list):
+        durations = np.sort(durations)
+        n = len(durations)
+        cdf_vals = np.arange(1, n + 1) / n
+        color = colors[i % len(colors)]
+        plt.plot(durations, cdf_vals, color=color, linewidth=2.5, label=labels[i])
+
+    if xlim:
+        plt.xlim(xlim)
+
+    plt.xlabel("Длительность проекта (дни)")
+    plt.ylabel("Накопленная вероятность (CDF)")
+    plt.title("CDF длительности проекта (разные процентили задач)")
+    plt.legend()
+    plt.grid(True, linestyle="--", alpha=0.7)
+    plt.tight_layout()
+
     plt.savefig(filename, dpi=300)
     plt.close()

@@ -3,7 +3,7 @@ from services.scheduler import build_schedule
 from services.metrics import calculate_project_duration, calculate_idle_time, monte_carlo_simulation, calculate_buffer
 from services.exporter import export_schedule_to_excel, export_percentile_analysis_to_excel
 from visualization.gantt_chart import plot_gantt
-from visualization.plot_percentiles_ends_distr import plot_percentile_distributions
+from visualization.plot_percentiles_ends_distr import plot_percentile_pdf, plot_percentile_cdfs
 from visualization.plot_idle_vs_duration import plot_idle_vs_duration
 
 import seaborn as sns
@@ -30,49 +30,51 @@ def part1_1_schedule_project(pr_buffer, path="data/tasks.csv", percentile=0.9, e
 
 def part1_2_explore_percentile_effect(percentiles, task_file="data/tasks.csv", n_iter=1_000, seed=None):
     results = []
+    all_durations = {}
 
+    # собираем все данные
     for p in tqdm(percentiles, desc="Анализ процентилей"):
-        # Плановое расписание для дедлайна
         base_tasks = load_tasks_from_csv(task_file)
         base_tasks = build_schedule(base_tasks, percentile=p, seed=seed)
 
         durations, idles = monte_carlo_simulation(task_file, p, n_iter, seed)
+        all_durations[p] = durations
 
-        plot_percentile_distributions([durations], [p], f'output/plots/project_duration_distributions_{p:.2f}.png')
-###
-        sorted_durations = sorted(durations)
-        # Создаем массивы для значений и их вероятностей
-        # x_values = np.unique(sorted_durations)
-        x_values = sorted_durations
-        y_prob = []
-
-        n = len(durations)
-        for x in x_values:
-            prob = np.sum(np.array(sorted_durations) <= x) / n
-            y_prob.append(prob)
-
-        
-        plt.plot(x_values, y_prob)
-        plt.xlim(0,200)
-
-        plt.savefig(f"output/plots/percentile_analysis_stacked_{p:.2f}.png", bbox_inches='tight')
-        plt.close()
-###
         avg_duration = np.mean(durations)
         roles = {role for idle in idles for role in idle}
         avg_idle = {role: np.mean([idle.get(role, 0.0) for idle in idles]) for role in roles}
         
-        row = {
-            "Процентиль": p,
-            "Среднее время проекта": round(avg_duration, 2)
-        }
-
+        row = {"Процентиль": p, "Среднее время проекта": round(avg_duration, 2)}
         for role, idle in avg_idle.items():
             row[f"Простой_{role}"] = round(idle, 2)
-
         results.append(row)
 
+    # общий диапазон по X (по квантилям, чтобы убрать хвосты)
+    all_values = np.concatenate(list(all_durations.values()))
+    # xmin, xmax = np.percentile(all_values, [1, 99])
+    xmin, xmax = int(np.min(all_values) - 1), int(np.max(all_values) + 1)
+
+    # === ОТДЕЛЬНЫЕ графики PDF и CDF для каждого процентиля ===
+    for p, durations in all_durations.items():
+        # PDF
+        plot_percentile_pdf(
+            durations_list=[durations],
+            labels=[f"p={p:.2f}"],
+            filename=f"output/plots/pdf_percentile_{p:.2f}.png",
+            bins=xmax-xmin,
+            xlim=(xmin, xmax)
+        )
+        # CDF
+        plot_percentile_cdfs(
+            durations_list=[durations],
+            labels=[f"p={p:.2f}"],
+            filename=f"output/plots/cdf_percentile_{p:.2f}.png",
+            xlim=(xmin, xmax)
+        )
+
+    # экспорт в Excel
     df = export_percentile_analysis_to_excel(results, "output/percentile_analysis.xlsx")
+    return df
 
 def part1_3_project_buffer(percentile_tasks=0.5, percentile_project=0.9, task_file="data/tasks.csv", n_iter=1000, seed=None):
     """
@@ -141,12 +143,12 @@ def part1_5_multiple_percentiles(percentiles, task_file="data/tasks.csv", seed=N
         base_tasks = build_schedule(base_tasks, percentile=p, seed=seed)
         durations, _ = monte_carlo_simulation(task_file, p, 1000, seed)
         res_dur.append(durations)
-    plot_percentile_distributions(res_dur, percentiles, 'output/plots/project_duration_distributions_multiple_percentiles.png')
+    plot_percentile_pdf(res_dur, percentiles, 'output/plots/project_duration_distributions_multiple_percentiles.png')
 
 def part1_6_plot_heatmaps(task_percentiles, project_percentiles):
     part1_6_1_heatmap_durations(task_percentiles=task_percentiles, project_percentiles=project_percentiles)
-    # part1_6_2_heatmap_human_resources(task_percentiles=task_percentiles, project_percentiles=project_percentiles)
-    # part1_6_3_heatmap_project_buffer(task_percentiles=task_percentiles, project_percentiles=project_percentiles)
+    part1_6_2_heatmap_human_resources(task_percentiles=task_percentiles, project_percentiles=project_percentiles)
+    part1_6_3_heatmap_project_buffer(task_percentiles=task_percentiles, project_percentiles=project_percentiles)
 
 def part1_6_1_heatmap_durations(task_file="data/tasks.csv", 
                                 task_percentiles=[0.5, 0.7, 0.9], 
