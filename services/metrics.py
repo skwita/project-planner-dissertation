@@ -32,8 +32,10 @@ def calculate_project_duration(tasks):
     return max(task.real_start_time + task.real_duration for task in tasks)
 
 def monte_carlo_simulation(task_file, percentile, n_iter, seed):
-    """Выполняет n_iter симуляций для заданного процентиля"""
-
+    """
+    Выполняет n_iter симуляций для заданного процентиля
+    Возвращает массив из длительностей расчитанных проектов
+    """
     rng = np.random.default_rng(seed)
     durations = []
     idle_records = []
@@ -50,3 +52,11 @@ def monte_carlo_simulation(task_file, percentile, n_iter, seed):
 
     return durations, idle_records
 
+def calculate_buffer(durations, planned_duration, percentile_project):
+    """
+    Расчитывает длину буфера проекта при определенном процентиле
+    """
+    durations = np.array(durations)
+    overruns = np.maximum(0, durations - planned_duration)
+    buffer_value = np.percentile(sorted(overruns), percentile_project)
+    return buffer_value

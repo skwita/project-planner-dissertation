@@ -16,8 +16,10 @@ class Task:
         self.real_end_time = None
 
     def sample_durations(self, percentile, seed=None):
+        """
+        Расчитывает плановые и фактические начала, длительности и концы задач
+        """
         np.random.seed(seed)
-        # sigma = self.stddev
 
         a = 1 + (self.stddev / self.mean) ** 2
         s = np.sqrt(np.log(a))
@@ -25,8 +27,3 @@ class Task:
         
         self.planned_duration = lognorm.ppf(percentile, s=s, scale=scale)
         self.real_duration = lognorm.rvs(s=s, scale=scale)
-
-        # sigma = np.sqrt(np.log(1 + np.sqrt(self.stddev / self.mean)))
-        # mu = np.log(self.mean) - 0.5 * sigma ** 2
-        # self.planned_duration = lognorm.ppf(percentile, s=sigma, scale=np.exp(mu))
-        # self.real_duration = lognorm.rvs(s=sigma, scale=np.exp(mu))

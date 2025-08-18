@@ -1,23 +1,24 @@
 from services.parser import load_tasks_from_csv
 from services.scheduler import build_schedule
-from services.metrics import calculate_project_duration, calculate_idle_time, monte_carlo_simulation
+from services.metrics import calculate_project_duration, calculate_idle_time, monte_carlo_simulation, calculate_buffer
 from services.exporter import export_schedule_to_excel, export_percentile_analysis_to_excel
 from visualization.gantt_chart import plot_gantt
-from visualization.plot_percentiles import plot_percentile_analysis
 from visualization.plot_percentiles_ends_distr import plot_percentile_distributions
+from visualization.plot_idle_vs_duration import plot_idle_vs_duration
 
+import seaborn as sns
 import matplotlib.pyplot as plt
 import numpy as np
 from tqdm import tqdm
 
-def part1_1_schedule_project(path="data/tasks.csv", percentile=0.9, export_excel=True ):
+def part1_1_schedule_project(pr_buffer, path="data/tasks.csv", percentile=0.9, export_excel=True ):
     tasks = load_tasks_from_csv(path)
     scheduled_tasks = build_schedule(tasks, percentile, seed=None)
     project_duration = calculate_project_duration(scheduled_tasks)
 
     idle = calculate_idle_time(tasks)
     
-    plot_gantt(scheduled_tasks, 'output/plots/gantt.png')
+    plot_gantt(scheduled_tasks, 'output/plots/gantt.png', pr_buffer)
 
     if export_excel:
         export_schedule_to_excel(
@@ -37,7 +38,7 @@ def part1_2_explore_percentile_effect(percentiles, task_file="data/tasks.csv", n
 
         durations, idles = monte_carlo_simulation(task_file, p, n_iter, seed)
 
-        plot_percentile_distributions(durations, p, f'output/plots/project_duration_distributions_{p}.png')
+        plot_percentile_distributions([durations], [p], f'output/plots/project_duration_distributions_{p:.2f}.png')
 ###
         sorted_durations = sorted(durations)
         # Создаем массивы для значений и их вероятностей
@@ -54,7 +55,7 @@ def part1_2_explore_percentile_effect(percentiles, task_file="data/tasks.csv", n
         plt.plot(x_values, y_prob)
         plt.xlim(0,200)
 
-        plt.savefig(f"output/plots/percentile_analysis_stacked_{p}.png", bbox_inches='tight')
+        plt.savefig(f"output/plots/percentile_analysis_stacked_{p:.2f}.png", bbox_inches='tight')
         plt.close()
 ###
         avg_duration = np.mean(durations)
@@ -72,7 +73,6 @@ def part1_2_explore_percentile_effect(percentiles, task_file="data/tasks.csv", n
         results.append(row)
 
     df = export_percentile_analysis_to_excel(results, "output/percentile_analysis.xlsx")
-    plot_percentile_analysis(df, "output/plots/percentile_analysis.png")
 
 def part1_3_project_buffer(percentile_tasks=0.5, percentile_project=0.9, task_file="data/tasks.csv", n_iter=1000, seed=None):
     """
@@ -94,16 +94,13 @@ def part1_3_project_buffer(percentile_tasks=0.5, percentile_project=0.9, task_fi
     durations, _ = monte_carlo_simulation(task_file, percentile_tasks, n_iter, seed)
 
     # 3. t90 — длительность, в которую укладывается 90% проектов
-    t_n = np.percentile(durations, percentile_project)
+    t_n = calculate_buffer(durations, calculate_project_duration(scheduled_tasks),  percentile_project)
 
-    # 4. Расчет буфера
-    buffer_n = t_n - planned_duration
 
     print(f"Плановая длительность: {planned_duration:.2f} дней")
-    print(f"Длительность t{percentile_project*100} проекта: {t_n:.2f} дней")
-    print(f"Буфер проекта ({percentile_project*100}%): {buffer_n:.2f} дней")
+    print(f"Буфер проекта ({percentile_project}%): {t_n :.2f} дней")
 
-    return buffer_n
+    return t_n
 
 def part1_4_plot_pareto_idle_vs_duration(percentiles_tasks, task_file="data/tasks.csv", seed=None, n_iter=1000, save_path="output/plots/pareto_idle_duration.png"):
     """
@@ -116,7 +113,6 @@ def part1_4_plot_pareto_idle_vs_duration(percentiles_tasks, task_file="data/task
     :param n_iter: количество итераций Монте-Карло
     :param save_path: путь для сохранения графика
     """
-    # ensure_dir(os.path.dirname(save_path))
     
     durations = []
     idles_sum = []
@@ -135,28 +131,130 @@ def part1_4_plot_pareto_idle_vs_duration(percentiles_tasks, task_file="data/task
         idles_sum.append(avg_idle_sum)
     
     # Построение графика
-    plt.figure(figsize=(8, 6))
-    scatter = plt.scatter(durations, idles_sum, c=percentiles_tasks, cmap='viridis', s=80, edgecolors='black')
-    
-    for i, p in enumerate(percentiles_tasks):
-        plt.text(durations[i] + 0.3, idles_sum[i] + 0.3, f"{p:.2f}", fontsize=8)
-    
-    plt.xlabel("Средняя длительность проекта (дни)")
-    plt.ylabel("Средний суммарный простой (дни)")
-    plt.title(f"Pareto: простои vs длительность ({n_iter} итераций)")
-    cbar = plt.colorbar(scatter)
-    cbar.set_label("Процентиль задач")
-    
-    plt.grid(True, linestyle="--", alpha=0.5)
+    plot_idle_vs_duration(durations, idles_sum, percentiles_tasks, n_iter, save_path)
+
+def part1_5_multiple_percentiles(percentiles, task_file="data/tasks.csv", seed=None):
+    res_dur = []
+    for p in tqdm(percentiles, desc="Анализ процентилей"):
+        # Плановое расписание для дедлайна
+        base_tasks = load_tasks_from_csv(task_file)
+        base_tasks = build_schedule(base_tasks, percentile=p, seed=seed)
+        durations, _ = monte_carlo_simulation(task_file, p, 1000, seed)
+        res_dur.append(durations)
+    plot_percentile_distributions(res_dur, percentiles, 'output/plots/project_duration_distributions_multiple_percentiles.png')
+
+def part1_6_plot_heatmaps(task_percentiles, project_percentiles):
+    part1_6_1_heatmap_durations(task_percentiles=task_percentiles, project_percentiles=project_percentiles)
+    # part1_6_2_heatmap_human_resources(task_percentiles=task_percentiles, project_percentiles=project_percentiles)
+    # part1_6_3_heatmap_project_buffer(task_percentiles=task_percentiles, project_percentiles=project_percentiles)
+
+def part1_6_1_heatmap_durations(task_file="data/tasks.csv", 
+                                task_percentiles=[0.5, 0.7, 0.9], 
+                                project_percentiles=[0.5, 0.7, 0.9], 
+                                seed=None, n_sim=100):
+    """
+    Тепловая карта длительности проекта в зависимости от процентиля задачи и проектного процентиля.
+    """
+    durations_matrix = np.zeros((len(task_percentiles), len(project_percentiles)))
+
+    for i, t_p in enumerate(tqdm(task_percentiles, desc="Task percentiles")):
+        for j, p_p in enumerate(project_percentiles):
+            # Считаем длительность проекта через Монте-Карло
+            sim_durations, _ = monte_carlo_simulation(task_file, t_p, n_sim, seed=seed)
+            pr_buffer = part1_3_project_buffer(percentile_tasks=t_p, percentile_project=p_p * 100) #TODO
+            durations_matrix[i, j] = np.average(sim_durations) + pr_buffer #TODO
+
+    plt.figure(figsize=(10, 6))
+    sns.heatmap(durations_matrix, 
+                annot=True, fmt=".1f", cmap="mako", 
+                xticklabels=[f"p={p :.2f}" for p in project_percentiles],
+                yticklabels=[f"p={t :.2f}" for t in task_percentiles])
+
+    plt.xlabel("Процентиль проекта")
+    plt.ylabel("Процентиль задачи")
+    plt.title("Тепловая карта длительности проекта")
     plt.tight_layout()
-    plt.savefig(save_path, dpi=300)
+    plt.savefig("output/plots/heatmap_durations_with_buffer.png", dpi=300) #TODO
     plt.close()
 
-    print(f"График сохранен в {save_path}")
+def part1_6_2_heatmap_human_resources(task_file="data/tasks.csv", 
+                                task_percentiles=[0.5, 0.7, 0.9], 
+                                project_percentiles=[0.5, 0.7, 0.9], 
+                                seed=None, n_sim=100):
+    """
+    Тепловая карта трудовых ресурсов проекта в зависимости от процентиля задачи и проектного процентиля.
+    """
+    durations_matrix = np.zeros((len(task_percentiles), len(project_percentiles)))
+
+    for i, t_p in enumerate(tqdm(task_percentiles, desc="Task percentiles")):
+        for j, p_p in enumerate(project_percentiles):
+            # Считаем длительность проекта через Монте-Карло
+            _, idles = monte_carlo_simulation(task_file, t_p, n_sim, seed=seed)
+
+            ammount = 1
+            summ = 0
+            for idle in idles:
+                summ += sum(idle.values())
+                ammount += 1
+
+            durations_matrix[i, j] = summ / ammount
+
+    plt.figure(figsize=(10, 6))
+    sns.heatmap(durations_matrix, 
+                annot=True, fmt=".1f", cmap="mako", 
+                xticklabels=[f"p={p :.2f}" for p in project_percentiles],
+                yticklabels=[f"p={t :.2f}" for t in task_percentiles])
+
+    plt.xlabel("Процентиль проекта")
+    plt.ylabel("Процентиль задачи")
+    plt.title("Тепловая карта трудовых ресурсов проекта")
+    plt.tight_layout()
+    plt.savefig("output/plots/heatmap_hr.png", dpi=300)
+    plt.close()
+
+def part1_6_3_heatmap_project_buffer(task_file="data/tasks.csv", 
+                                task_percentiles=[0.5, 0.7, 0.9], 
+                                project_percentiles=[0.5, 0.7, 0.9], 
+                                seed=None, n_sim=100):
+    """
+    Тепловая карта буфера проекта в зависимости от процентиля задачи и проектного процентиля.
+    """
+    durations_matrix = np.zeros((len(task_percentiles), len(project_percentiles)))
+
+    for i, t_p in enumerate(tqdm(task_percentiles, desc="Task percentiles")):
+        for j, p_p in enumerate(project_percentiles):
+            # Считаем длительность проекта через Монте-Карло
+            pr_buffer = part1_3_project_buffer(percentile_tasks=t_p, percentile_project=p_p * 100)
+            durations_matrix[i, j] = pr_buffer
+
+    plt.figure(figsize=(10, 6))
+    sns.heatmap(durations_matrix, 
+                annot=True, fmt=".1f", cmap="mako", 
+                xticklabels=[f"p={p :.2f}" for p in project_percentiles],
+                yticklabels=[f"p={t :.2f}" for t in task_percentiles])
+
+    plt.xlabel("Процентиль проекта")
+    plt.ylabel("Процентиль задачи")
+    plt.title("Тепловая карта буферов проекта")
+    plt.tight_layout()
+    plt.savefig("output/plots/heatmap_buffer.png", dpi=300)
+    plt.close()
 
 if __name__ == "__main__":
-    # part1_1_schedule_project(percentile=0.5)
-    # part1_2_explore_percentile_effect(percentiles=np.arange(0.05, 0.96, 0.05))
-    # part1_3_project_buffer(percentile_tasks=0.1, percentile_project=0.9)
-    part1_4_plot_pareto_idle_vs_duration(np.arange(0.05, 0.96, 0.05))
+    PERCENTILE_TASK = 0.5
+    PERCENTILE_PROJECT = 0.9
+    PERCENTILES_RANGE = np.arange(0.05, 0.96, 0.05)
+
+    # Нахождение буфера проекта
+    pr_buffer = part1_3_project_buffer(percentile_tasks=PERCENTILE_TASK, percentile_project=PERCENTILE_PROJECT * 100)
+    # Расчет задач, построение диаграммы Гантта, экспорт таблицы задач
+    part1_1_schedule_project(pr_buffer, percentile=PERCENTILE_TASK)
+    # Построение графиков кумулятивных функций распределения и плотности вероятности
+    part1_2_explore_percentile_effect(percentiles=PERCENTILES_RANGE)
+    # Построение Парето графика (Простои-Длительность для разных процентилей задач)
+    part1_4_plot_pareto_idle_vs_duration(PERCENTILES_RANGE)
+    # Построение графика плотности вероятности с разными процентилями
+    part1_5_multiple_percentiles([0.3, 0.6, 0.9])
+    # Тепловые карты по длительности, 
+    part1_6_plot_heatmaps(task_percentiles=PERCENTILES_RANGE, project_percentiles=PERCENTILES_RANGE)
    

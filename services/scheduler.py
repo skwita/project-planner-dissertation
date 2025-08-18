@@ -31,39 +31,6 @@ def build_schedule(tasks, percentile, seed=None):
             in_degree[neighbor] -= 1
             if in_degree[neighbor] == 0:
                 queue.append(neighbor)
-    
-    # 4. Расчет временных параметров
-    # earliest_start = defaultdict(float)
-    # role_available_time = defaultdict(float)  # Когда роль освободится
-    
-    # for task_id in scheduled_order:
-    #     task = task_map[task_id]
-        
-    #     # Максимум из:
-    #     # - времени завершения всех зависимостей
-    #     # - времени доступности роли
-        
-    #     dep_end_time = max(
-    #         [earliest_start[dep_id] + max(task_map[dep_id].planned_duration, task_map[dep_id].real_duration) 
-    #          for dep_id in task.dependencies],
-    #         default=0
-    #     )
-        
-    #     task.start_time = max(dep_end_time, role_available_time[task.role])
-    #     earliest_start[task_id] = task.start_time
-
-    #     planned_dependency_end = max(
-    #         [task_map[dep].start_time + task_map[dep].planned_duration for dep in task.dependencies],
-    #         default=0
-    #     )
-
-    #     task.planned_start_time = max(planned_dependency_end, role_available_time[task.role])
-        
-    #     # Обновляем время доступности роли
-        
-    #     role_available_time[task.role] = task.start_time + max(task.planned_duration, task.real_duration)
-    
-    # return tasks
 
     role_planned_ready = defaultdict(float)
     role_real_ready = defaultdict(float)

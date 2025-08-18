@@ -2,7 +2,7 @@ import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 import matplotlib.colors as mcolors
 
-def plot_gantt(tasks, filename):
+def plot_gantt(tasks, filename, pr_buffer):
     _, ax = plt.subplots(figsize=(14, 6))
 
     roles = sorted({task.role for task in tasks})
@@ -22,6 +22,19 @@ def plot_gantt(tasks, filename):
 
         # Реальное выполнение (поверх плана, уже с другим уровнем)
         ax.barh(i, task.real_duration, left=task.real_start_time, height=0.2, color='black')
+
+    # --- Буфер проекта ---
+    if pr_buffer is not None and pr_buffer > 0:
+        planned_end_project = max(task.planned_end_time for task in tasks)
+
+        ax.barh(
+            len(tasks), pr_buffer, 
+            left=planned_end_project, 
+            height=0.5, color='red', alpha=0.6
+        )
+
+        y_labels.append("Буфер проекта")
+        yticks.append(len(tasks))
 
     ax.set_yticks(yticks)
     ax.set_yticklabels(y_labels)
