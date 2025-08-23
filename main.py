@@ -18,7 +18,7 @@ def part1_1_schedule_project(pr_buffer, path="data/tasks.csv", percentile=0.9, e
 
     idle = calculate_idle_time(tasks)
     
-    plot_gantt(scheduled_tasks, 'output/plots/gantt.png', pr_buffer)
+    plot_gantt(scheduled_tasks, f'output/plots/gantt_{percentile}.png', pr_buffer)
 
     if export_excel:
         export_schedule_to_excel(
@@ -246,17 +246,26 @@ if __name__ == "__main__":
     PERCENTILE_TASK = 0.5
     PERCENTILE_PROJECT = 0.9
     PERCENTILES_RANGE = np.arange(0.05, 0.96, 0.05)
+    PERCENTILES_FOR_PLOT = [0.3, 0.6, 0.9]
 
     # Нахождение буфера проекта
     pr_buffer = part1_3_project_buffer(percentile_tasks=PERCENTILE_TASK, percentile_project=PERCENTILE_PROJECT * 100)
     # Расчет задач, построение диаграммы Гантта, экспорт таблицы задач
     part1_1_schedule_project(pr_buffer, percentile=PERCENTILE_TASK)
-    # Построение графиков кумулятивных функций распределения и плотности вероятности
-    part1_2_explore_percentile_effect(percentiles=PERCENTILES_RANGE)
-    # Построение Парето графика (Простои-Длительность для разных процентилей задач)
-    part1_4_plot_pareto_idle_vs_duration(PERCENTILES_RANGE)
-    # Построение графика плотности вероятности с разными процентилями
-    part1_5_multiple_percentiles([0.3, 0.6, 0.9])
-    # Тепловые карты по длительности, 
-    part1_6_plot_heatmaps(task_percentiles=PERCENTILES_RANGE, project_percentiles=PERCENTILES_RANGE)
+    # # Построение графиков кумулятивных функций распределения и плотности вероятности
+    # part1_2_explore_percentile_effect(percentiles=PERCENTILES_RANGE)
+    # # Построение Парето графика (Простои-Длительность для разных процентилей задач)
+    # part1_4_plot_pareto_idle_vs_duration(PERCENTILES_RANGE)
+    # # Построение графика плотности вероятности с разными процентилями
+    # part1_5_multiple_percentiles(PERCENTILES_FOR_PLOT)
+    # # Тепловые карты по длительности, 
+    # part1_6_plot_heatmaps(task_percentiles=PERCENTILES_RANGE, project_percentiles=PERCENTILES_RANGE)
    
+    # Нахождение буфера проекта
+    pr_buffer = part1_3_project_buffer(percentile_tasks=0.3, percentile_project=PERCENTILE_PROJECT * 100)
+    # Расчет задач, построение диаграммы Гантта, экспорт таблицы задач
+    part1_1_schedule_project(pr_buffer, percentile=0.3)
+    # Нахождение буфера проекта
+    pr_buffer = part1_3_project_buffer(percentile_tasks=0.9, percentile_project=PERCENTILE_PROJECT * 100)
+    # Расчет задач, построение диаграммы Гантта, экспорт таблицы задач
+    part1_1_schedule_project(pr_buffer, percentile=0.9)
