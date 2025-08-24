@@ -1,8 +1,10 @@
+from concurrent import futures
 from collections import defaultdict
 import numpy as np
 from services.parser import load_tasks_from_csv
 from services.scheduler import build_schedule
 from tqdm import tqdm
+import copy
 
 def calculate_idle_time_old(tasks):
     """
@@ -66,26 +68,59 @@ def calculate_idle_time(tasks):
 def calculate_project_duration(tasks):
     return max(task.real_start_time + task.real_duration for task in tasks)
 
+
 def monte_carlo_simulation(task_file, percentile, n_iter, seed):
     """
     Выполняет n_iter симуляций для заданного процентиля
-    Возвращает массив из длительностей расчитанных проектов
+    Возвращает массив из длительностей рассчитанных проектов
     """
     rng = np.random.default_rng(seed)
-    durations = []
+
+    # Загружаем задачи один раз
+    base_tasks = load_tasks_from_csv(task_file)
+
+    # Предгенерация seed-ов для итераций
+    seeds = rng.integers(1_000_000, size=n_iter)
+
+    durations = np.empty(n_iter, dtype=float)   # быстрее чем list
     idle_records = []
 
-    for _ in tqdm(range(n_iter), desc=f"Процентиль {percentile}", leave=False):
-        tasks = load_tasks_from_csv(task_file)
-        tasks = build_schedule(tasks, percentile=percentile, seed=rng.integers(1_000_000))
+    for i, sim_seed in enumerate(tqdm(seeds, desc=f"Процентиль {percentile}", leave=False)):
+        # Копируем задачи (без повторного чтения файла)
+        for task in base_tasks:
+            task.reset()
 
-        duration = max(t.real_start_time + t.real_duration for t in tasks)
-        idle = calculate_idle_time(tasks)
+        # Строим расписание
+        build_schedule(base_tasks, percentile=percentile, seed=sim_seed)
 
-        durations.append(duration)
+        # Длительность проекта = max(real_end_time)
+        duration = max(t.real_end_time for t in base_tasks)
+
+        # Простой по ролям
+        idle = calculate_idle_time(base_tasks)
+
+        durations[i] = duration
         idle_records.append(idle)
 
     return durations, idle_records
+
+def parallel_monte_carlo_simulation(task_file, percentiles, n_iter, seed):
+    results = {}
+    with futures.ProcessPoolExecutor() as executor:
+        # отправляем задачи и запоминаем, какому p соответствует future
+        future_to_p = {
+            executor.submit(monte_carlo_simulation, task_file, p, n_iter, seed): p
+            for p in percentiles
+        }
+
+        # ждём выполнения
+        for future in futures.as_completed(future_to_p):
+            p = future_to_p[future]
+            try:
+                results[p] = future.result()
+            except Exception as e:
+                results[p] = e  # чтобы не терять ошибки
+    return results
 
 def calculate_buffer(durations, planned_duration, percentile_project):
     """

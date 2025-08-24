@@ -46,4 +46,4 @@ def plot_gantt(tasks, filename, pr_buffer):
     ])
     plt.tight_layout()
     plt.savefig(filename)
-    plt.show()
+    plt.close()

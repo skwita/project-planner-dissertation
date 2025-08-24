@@ -27,3 +27,11 @@ class Task:
         
         self.planned_duration = lognorm.ppf(percentile, s=s, scale=scale)
         self.real_duration = lognorm.rvs(s=s, scale=scale)
+
+    def reset(self):
+        self.planned_duration = None
+        self.planned_start_time = None
+        self.planned_end_time = None
+        self.real_duration = None
+        self.real_start_time = None
+        self.real_end_time = None

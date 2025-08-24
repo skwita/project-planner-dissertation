@@ -1,4 +1,10 @@
 import matplotlib.pyplot as plt
+import numpy as np
+from scipy.optimize import curve_fit
+
+def exp_func(x, a, b, c):
+    """Экспоненциальная аппроксимация"""
+    return a * np.exp(b * x) + c
 
 def plot_idle_vs_duration(durations, idles_sum, percentiles_tasks, n_iter, save_path):
     """
@@ -17,6 +23,18 @@ def plot_idle_vs_duration(durations, idles_sum, percentiles_tasks, n_iter, save_
         s=80, edgecolors='black'
     )
     
+        
+    # --- Экспоненциальная аппроксимация ---
+    try:
+        popt, _ = curve_fit(exp_func, durations, idles_sum, p0=(1, 0.01, 1), maxfev=10000)
+        x_fit = np.linspace(min(durations), max(durations), 300)
+        y_fit = exp_func(x_fit, *popt)
+        plt.plot(x_fit, y_fit, "r--", linewidth=2, label="Экспоненциальная аппроксимация")
+    except RuntimeError:
+        print("⚠️ Не удалось выполнить экспоненциальную аппроксимацию")
+    # --------------------------------------
+    
+
     # Подписи точек
     for i, p in enumerate(percentiles_tasks):
         plt.text(durations[i] + 0.3, idles_sum[i] + 0.3, f"{p:.2f}", fontsize=8)
