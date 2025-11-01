@@ -36,14 +36,17 @@ def plot_gantt(tasks, filename, pr_buffer):
         y_labels.append("Буфер проекта")
         yticks.append(len(tasks))
 
+    ax.invert_yaxis()
+
     ax.set_yticks(yticks)
     ax.set_yticklabels(y_labels)
     ax.set_xlabel("Время")
-    ax.set_title("Диаграмма Ганта: план vs. факт (цвет = роль)")
+    ax.set_title("Диаграмма Ганта")
     ax.legend(handles=[
         plt.Rectangle((0, 0), 1, 1, color='black', label='Факт'),
         plt.Rectangle((0, 0), 1, 1, color='gray', alpha=0.6, label='План')
     ])
+    
     plt.tight_layout()
     plt.savefig(filename)
     plt.close()

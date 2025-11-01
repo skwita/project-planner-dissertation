@@ -1,4 +1,6 @@
+from collections import defaultdict
 from concurrent import futures
+import copy
 from services.parser import load_tasks_from_csv
 from services.scheduler import build_schedule
 from services.metrics import calculate_project_duration, calculate_idle_time, monte_carlo_simulation, calculate_buffer, parallel_monte_carlo_simulation
@@ -15,27 +17,53 @@ import numpy as np
 
 matplotlib.use("Agg")
 
-def part1_1_schedule_project(pr_buffer, path="data/tasks.csv", percentile=0.9, export_excel=True ):
+def part1_1_schedule_project(pr_buffer, path="data/tasks.csv", percentile=0.9, export_excel=True, runs=10000):
     print("______________________________________________________")
     print(f"part1_1 started at {datetime.now().time()}")
     print("______________________________________________________")
-    tasks = load_tasks_from_csv(path)
-    scheduled_tasks = build_schedule(tasks, percentile, seed=None)
-    project_duration = calculate_project_duration(scheduled_tasks)
 
-    idle = calculate_idle_time(tasks)
-    
+    tasks = load_tasks_from_csv(path)
+
+    aggregated = defaultdict(lambda: defaultdict(list))
+
+    for run in range(runs):
+        tasks_copy = copy.deepcopy(tasks)
+        scheduled = build_schedule(tasks_copy, percentile, seed=run)
+
+        for task in scheduled:
+            aggregated[task.task_id]["planned_start_time"].append(task.planned_start_time)
+            aggregated[task.task_id]["planned_end_time"].append(task.planned_end_time)
+            aggregated[task.task_id]["real_start_time"].append(task.real_start_time)
+            aggregated[task.task_id]["real_end_time"].append(task.real_end_time)
+
+    scheduled_tasks = copy.deepcopy(tasks)
+    for task in scheduled_tasks:
+        task.planned_start_time = float(np.mean(aggregated[task.task_id]["planned_start_time"]))
+        task.planned_end_time   = float(np.mean(aggregated[task.task_id]["planned_end_time"]))
+        task.real_start_time    = float(np.mean(aggregated[task.task_id]["real_start_time"]))
+        task.real_end_time      = float(np.mean(aggregated[task.task_id]["real_end_time"]))
+
+        # пересчёт длительностей
+        task.planned_duration = task.planned_end_time - task.planned_start_time
+        task.real_duration    = task.real_end_time - task.real_start_time
+
+    # считаем метрики уже на усреднённых задачах
+    project_duration = calculate_project_duration(scheduled_tasks)
+    idle = calculate_idle_time(scheduled_tasks)
+
     plot_gantt(scheduled_tasks, f'output/plots/gantt_{percentile}.png', pr_buffer)
 
     if export_excel:
         export_schedule_to_excel(
-            tasks,
-            filename= "output/output_schedule.xlsx",
+            scheduled_tasks,
+            filename="output/output_schedule.xlsx",
             project_duration=project_duration,
             idle_time=idle
         )
 
-def part1_2_explore_percentile_effect(percentiles, task_file="data/tasks.csv", n_iter=1_000, seed=None):
+    return scheduled_tasks, project_duration, idle
+
+def part1_2_explore_percentile_effect(percentiles, task_file="data/tasks.csv", n_iter=100_000, seed=None):
     print("______________________________________________________")
     print(f"part1_2 started at {datetime.now().time()}")
     print("______________________________________________________")
@@ -85,7 +113,7 @@ def part1_2_explore_percentile_effect(percentiles, task_file="data/tasks.csv", n
     df = export_percentile_analysis_to_excel(results, "output/percentile_analysis.xlsx")
     return df
 
-def part1_3_project_buffer(percentile_tasks=0.5, percentile_project=0.9, task_file="data/tasks.csv", n_iter=1000, seed=None):
+def part1_3_project_buffer(percentile_tasks=0.5, percentile_project=0.9, task_file="data/tasks.csv", n_iter=1_000, seed=None):
     """
     Рассчитывает размер буфера проекта (buffer_90) как:
     buffer_90 = t90 - плановое время окончания последней задачи.
@@ -110,7 +138,7 @@ def part1_3_project_buffer(percentile_tasks=0.5, percentile_project=0.9, task_fi
 
     return t_n
 
-def part1_4_plot_pareto_idle_vs_duration(percentiles_tasks, task_file="data/tasks.csv", seed=None, n_iter=1000, save_path="output/plots/pareto_idle_duration.png"):
+def part1_4_plot_pareto_idle_vs_duration(percentiles_tasks, task_file="data/tasks.csv", seed=None, n_iter=100_000, save_path="output/plots/pareto_idle_duration.png"):
     """
     Строит график Парето: средняя длительность проекта vs средний суммарный простой
     при разных перцентилях задач, рассчитанные по результатам Monte Carlo.
@@ -153,11 +181,12 @@ def part1_5_multiple_percentiles(percentiles, task_file="data/tasks.csv", seed=N
     print("______________________________________________________")
 
     res_dur = []
-    parallel_results = parallel_monte_carlo_simulation(task_file, percentiles, 1000, seed)
+    parallel_results = parallel_monte_carlo_simulation(task_file, percentiles, 100_000, seed)
     for p in percentiles:
         durations, _ = parallel_results[p]
         res_dur.append(durations)
-    plot_percentile_pdf(res_dur, percentiles, 'output/plots/project_duration_distributions_multiple_percentiles.png')
+    plot_percentile_pdf(res_dur, percentiles, 'output/plots/project_duration_distributions_multiple_percentiles_pdf.png')
+    plot_percentile_cdfs(res_dur, percentiles, 'output/plots/project_duration_distributions_multiple_percentiles_cdf.png')
 
 def part1_6_plot_heatmaps(task_percentiles, project_percentiles):
     print("______________________________________________________")
@@ -295,10 +324,11 @@ def part1_6_3_heatmap_project_buffer(task_file="data/tasks.csv",
     plt.close()
 
 if __name__ == "__main__":
-    PERCENTILE_TASK = 0.5
+    PERCENTILE_TASK = 0.9
     PERCENTILE_PROJECT = 0.9
-    PERCENTILES_RANGE = np.arange(0.05, 0.96, 0.05)
-    PERCENTILES_FOR_PLOT = [0.3, 0.6, 0.9]
+    # PERCENTILES_RANGE = np.arange(0.05, 0.96, 0.05)
+    PERCENTILES_RANGE = [0.1, 0.5, 0.9]
+    PERCENTILES_FOR_PLOT = [0.1, 0.5, 0.9]
 
     print("______________________________________________________")
     print(f"Started at {datetime.now().time()}")
@@ -306,6 +336,7 @@ if __name__ == "__main__":
     
     # Нахождение буфера проекта
     pr_buffer = part1_3_project_buffer(percentile_tasks=PERCENTILE_TASK, percentile_project=PERCENTILE_PROJECT * 100)
+    # pr_buffer = 0
     # Расчет задач, построение диаграммы Гантта, экспорт таблицы задач
     part1_1_schedule_project(pr_buffer, percentile=PERCENTILE_TASK)
     # Построение графиков кумулятивных функций распределения и плотности вероятности

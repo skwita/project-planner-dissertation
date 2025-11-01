@@ -5,6 +5,9 @@ from scipy.optimize import curve_fit
 def exp_func(x, a, b, c):
     """Экспоненциальная аппроксимация"""
     return a * np.exp(b * x) + c
+def hyp_func(x, a, b, c):
+    """Экспоненциальная аппроксимация"""
+    return a / (x - b) + c
 
 def plot_idle_vs_duration(durations, idles_sum, percentiles_tasks, n_iter, save_path):
     """
@@ -26,9 +29,10 @@ def plot_idle_vs_duration(durations, idles_sum, percentiles_tasks, n_iter, save_
         
     # --- Экспоненциальная аппроксимация ---
     try:
-        popt, _ = curve_fit(exp_func, durations, idles_sum, p0=(1, 0.01, 1), maxfev=10000)
+        popt, _ = curve_fit(hyp_func, durations, idles_sum, p0=(1, 0.01, 1), maxfev=10000)
+        print(f"⚙️ Параметры аппроксимации: a={popt[0]:.4f}, b={popt[1]:.4f}, c={popt[2]:.4f}")
         x_fit = np.linspace(min(durations), max(durations), 300)
-        y_fit = exp_func(x_fit, *popt)
+        y_fit = hyp_func(x_fit, *popt)
         plt.plot(x_fit, y_fit, "r--", linewidth=2, label="Экспоненциальная аппроксимация")
     except RuntimeError:
         print("⚠️ Не удалось выполнить экспоненциальную аппроксимацию")
@@ -37,7 +41,7 @@ def plot_idle_vs_duration(durations, idles_sum, percentiles_tasks, n_iter, save_
 
     # Подписи точек
     for i, p in enumerate(percentiles_tasks):
-        plt.text(durations[i] + 0.3, idles_sum[i] + 0.3, f"{p:.2f}", fontsize=8)
+        plt.text(durations[i] + 0.3, idles_sum[i] + 0.3, f"{p*100:.0f}", fontsize=8)
     
     plt.xlabel("Средняя длительность проекта (дни)")
     plt.ylabel("Средний суммарный простой (дни)")
