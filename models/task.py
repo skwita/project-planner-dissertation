@@ -7,7 +7,7 @@ class Task:
         self.role = role
         self.dependencies = dependencies
         self.mean = float(mean)
-        self.stddev = float(stddev)
+        self.stddev = float(stddev) 
         self.planned_duration = None
         self.planned_start_time = None
         self.planned_end_time = None

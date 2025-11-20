@@ -1,9 +1,10 @@
-from collections import defaultdict
+from collections import defaultdict, deque
 from concurrent import futures
 import copy
+from services.critical_path import critical_chain_path, find_critical_path
 from services.parser import load_tasks_from_csv
 from services.scheduler import build_schedule
-from services.metrics import calculate_project_duration, calculate_idle_time, monte_carlo_simulation, calculate_buffer, parallel_monte_carlo_simulation
+from services.metrics import calculate_project_duration, calculate_idle_time, monte_carlo_schedules, monte_carlo_simulation, calculate_buffer, parallel_monte_carlo_simulation
 from services.exporter import export_schedule_to_excel, export_percentile_analysis_to_excel
 from visualization.gantt_chart import plot_gantt
 from visualization.plot_percentiles_ends_distr import plot_percentile_pdf, plot_percentile_cdfs
@@ -14,6 +15,7 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 import matplotlib
 import numpy as np
+import networkx as nx
 
 matplotlib.use("Agg")
 
@@ -323,27 +325,206 @@ def part1_6_3_heatmap_project_buffer(task_file="data/tasks.csv",
     plt.savefig("output/plots/heatmap_buffer.png", dpi=300)
     plt.close()
 
+def find_critical_path(tasks):
+    """
+    Находит критический путь среди задач Task.
+    Возвращает список task_id в порядке выполнения.
+    """
+    G = nx.DiGraph()
+
+    # Добавляем вершины и длительности
+    for t in tasks:
+        if t.planned_duration is None:
+            if t.planned_start_time is not None and t.planned_end_time is not None:
+                duration = t.planned_end_time - t.planned_start_time
+            else:
+                duration = t.mean  # fallback
+        else:
+            duration = t.planned_duration
+        G.add_node(t.task_id, duration=duration)
+
+    # Добавляем зависимости
+    for t in tasks:
+        for dep in t.dependencies:
+            G.add_edge(dep, t.task_id)
+
+    # Находим критический путь
+    critical_path = nx.dag_longest_path(G, weight='duration')
+    return critical_path
+
+
+def buffer_penetration_timeline(tasks, project_buffer):
+    """
+    Классический график сгорания буфера (Buffer Fever Chart).
+    X — прогресс проекта (% выполнения),
+    Y — остаток буфера (% неиспользованного).
+    """
+
+    critical_tasks_ids = critical_chain_path(tasks)
+
+    # crit_tasks = []
+    # for t_id in critical_tasks_ids:
+    #     thisTask = None
+    #     for task in tasks:
+    #         if task.task_id == t_id:
+    #             thisTask = task
+    #     crit_tasks.append(thisTask)
+    crit_tasks = critical_tasks_ids
+    crit_tasks.sort(key=lambda t: t.planned_end_time)
+
+    # 3️⃣ Моделируем сгорание буфера
+    total_delay = 0.0
+    buffer_remaining = []
+    times = []
+    delays = []
+
+    for i, task in enumerate(crit_tasks):
+        if i != 0:
+            delays.append(max(0, task.real_end_time - task.planned_end_time) - sum(delays[:i]))
+        else:
+            delays.append(max(0, task.real_end_time - task.planned_end_time))
+
+    buffer_remaining.append(project_buffer)
+    times.append(0)
+    
+    for i, t in enumerate(crit_tasks):
+        plan_end = t.planned_end_time
+        real_end = t.real_end_time
+
+        # Проверка на корректность
+        if plan_end is None or real_end is None:
+            continue
+
+        # Задержка текущей задачи
+        # delay = max(0, real_end - plan_end)
+
+
+        # # Остаток буфера
+        # remaining = max(0, project_buffer - total_delay)
+        # buffer_remaining.append(remaining / project_buffer)
+        # times.append(plan_end)
+
+        buffer_remaining.append(project_buffer)
+        times.append(plan_end)
+        # buffer_remaining.append(project_buffer - delays[i])
+        # times.append(real_end)
+
+        project_buffer -= delays[i]
+
+    # 4️⃣ Визуализация
+    plt.figure(figsize=(10, 5))
+
+    # === 1. Фиксируем верхнюю точку графика ===
+    initial_buffer = buffer_remaining[0]
+
+    # === 2. Нормированный прогресс ===
+    x0 = times[0]
+    x1 = times[-1]
+    progress = [(t - x0) / (x1 - x0) for t in times]
+
+    # === 3. Центральная линия (идеальное сгорание) ===
+    ideal_y = [initial_buffer * (1 - p) for p in progress]
+
+    # === 4. Сигмы ===
+    sigma = initial_buffer / 6  # чтобы ±3σ покрывали высоту буфера
+
+    # === 5. Симметричный веер зон ===
+    green_upper = [initial_buffer * (1 - p) + sigma * p for p in progress]
+    green_lower = [initial_buffer * (1 - p) - sigma * p for p in progress]
+
+    yellow_upper = [initial_buffer * (1 - p) + 2*sigma * p for p in progress]
+    yellow_lower = [initial_buffer * (1 - p) - 2*sigma * p for p in progress]
+
+    red_upper = [initial_buffer * (1 - p) + 3*sigma * p for p in progress]
+    red_lower = [initial_buffer * (1 - p) - 3*sigma * p for p in progress]
+
+    # === 6. Обрезка значений ===
+    # def clamp(v): return max(0, v)
+    # green_upper = [clamp(v) for v in green_upper]
+    # yellow_upper = [clamp(v) for v in yellow_upper]
+    # red_upper = [clamp(v) for v in red_upper]
+
+    # green_lower = [clamp(v) for v in green_lower]
+    # yellow_lower = [clamp(v) for v in yellow_lower]
+    # red_lower = [clamp(v) for v in red_lower]
+
+
+    # --- Окружение границ графика ---
+    y_max = max(buffer_remaining) * 1.1  # или просто initial_buffer * 1.1
+    y_min = 0
+
+    # === Красная зона сверху ===
+    plt.fill_between(
+        times,
+        y_max,
+        yellow_upper,
+        color="green",
+        alpha=0.08
+    )
+
+    # === Красная зона снизу ===
+    plt.fill_between(
+        times,
+        yellow_lower,
+        min(buffer_remaining),
+        color="red",
+        alpha=0.08
+    )
+
+    # === 7. Отрисовка зон ===
+    # plt.fill_between(times, red_lower, red_upper, color="red", alpha=0.10, label="Красная зона (±3σ)")
+    plt.fill_between(times, yellow_lower, yellow_upper, color="yellow", alpha=0.10)
+    # plt.fill_between(times, green_lower, green_upper, color="green", alpha=0.10, label="Зелёная зона (±1σ)")
+
+    plt.plot(times, buffer_remaining, marker=".", color="tab:blue", label="Оставшийся буфер")
+
+    # plt.fill_between(times, 0.7, 1, color="green", alpha=0.1, label="Зелёная зона")
+    # plt.fill_between(times, 0.3, 0.7, color="yellow", alpha=0.1, label="Жёлтая зона")
+    # plt.fill_between(times, 0, 0.3, color="red", alpha=0.1, label="Красная зона")
+
+    for i, t in enumerate(crit_tasks):
+        # plt.text(times[i*2+1], buffer_remaining[i*2+1], f"{t.task_id}", rotation=0, ha='right', fontsize=8)
+        plt.text(times[i], buffer_remaining[i], f"{t.task_id}", rotation=0, ha='right', fontsize=8)
+
+    plt.title("Сгорание буфера проекта (по критическому пути)")
+    plt.xlabel("Плановое время окончания задачи")
+    plt.ylabel("Оставшийся буфер")
+    plt.ylim(min(0,buffer_remaining[-1]), buffer_remaining[0]+buffer_remaining[0]*0.1)
+    plt.grid(alpha=0.3)
+    plt.legend()
+    plt.show()
+    plt.savefig("output/plots/buffer_penetration_timeline.png", dpi=300, bbox_inches="tight")
+
+
+
+
+
+
 if __name__ == "__main__":
-    PERCENTILE_TASK = 0.9
-    PERCENTILE_PROJECT = 0.9
-    # PERCENTILES_RANGE = np.arange(0.05, 0.96, 0.05)
-    PERCENTILES_RANGE = [0.1, 0.5, 0.9]
+    PERCENTILE_TASK = 0.2
+    PERCENTILE_PROJECT = 0.6
+    PERCENTILES_RANGE = np.arange(0.05, 0.96, 0.05)
+    # PERCENTILES_RANGE = [0.1, 0.5, 0.9]
     PERCENTILES_FOR_PLOT = [0.1, 0.5, 0.9]
 
     print("______________________________________________________")
     print(f"Started at {datetime.now().time()}")
     print("______________________________________________________")
     
-    # Нахождение буфера проекта
+    # # Нахождение буфера проекта
     pr_buffer = part1_3_project_buffer(percentile_tasks=PERCENTILE_TASK, percentile_project=PERCENTILE_PROJECT * 100)
-    # pr_buffer = 0
-    # Расчет задач, построение диаграммы Гантта, экспорт таблицы задач
-    part1_1_schedule_project(pr_buffer, percentile=PERCENTILE_TASK)
-    # Построение графиков кумулятивных функций распределения и плотности вероятности
-    part1_2_explore_percentile_effect(percentiles=PERCENTILES_RANGE)
-    # Построение Парето графика (Простои-Длительность для разных процентилей задач)
-    part1_4_plot_pareto_idle_vs_duration(PERCENTILES_RANGE)
-    # Построение графика плотности вероятности с разными процентилями
-    part1_5_multiple_percentiles(PERCENTILES_FOR_PLOT)
-    # Тепловые карты по длительности, 
-    part1_6_plot_heatmaps(task_percentiles=PERCENTILES_RANGE, project_percentiles=PERCENTILES_RANGE)
+    # # print(pr_buffer)
+    # # # pr_buffer = 0
+    # # # Расчет задач, построение диаграммы Гантта, экспорт таблицы задач
+    scheduled_tasks, _, _ = part1_1_schedule_project(pr_buffer, percentile=PERCENTILE_TASK)
+    # # Построение графиков кумулятивных функций распределения и плотности вероятности
+    # part1_2_explore_percentile_effect(percentiles=PERCENTILES_RANGE)
+    # # Построение Парето графика (Простои-Длительность для разных процентилей задач)
+    # part1_4_plot_pareto_idle_vs_duration(PERCENTILES_RANGE)
+    # # Построение графика плотности вероятности с разными процентилями
+    # part1_5_multiple_percentiles(PERCENTILES_FOR_PLOT)
+    # # Тепловые карты по длительности, 
+    # part1_6_plot_heatmaps(task_percentiles=PERCENTILES_RANGE, project_percentiles=PERCENTILES_RANGE)
+
+    buffer_penetration_timeline(scheduled_tasks, pr_buffer)
+

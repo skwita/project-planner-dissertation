@@ -6,30 +6,6 @@ from services.scheduler import build_schedule
 from tqdm import tqdm
 import copy
 
-def calculate_idle_time_old(tasks):
-    """
-    Возвращает словарь: роль → суммарный простой (в человеко-днях)
-    """
-    role_tasks = defaultdict(list)
-
-    for task in tasks:
-        role_tasks[task.role].append(task)
-
-    role_idle_time = {}
-
-    for role, tasks_for_role in role_tasks.items():
-        # Сортируем задачи по началу выполнения
-        sorted_tasks = sorted(tasks_for_role, key=lambda t: t.real_start_time)
-
-        idle = 0.0
-
-        for task in sorted_tasks:
-            idle += task.real_start_time - task.planned_start_time
-
-        role_idle_time[role] = idle
-
-    return role_idle_time
-
 def calculate_idle_time(tasks):
     """
     Возвращает словарь: роль → суммарный простой (в человеко-днях).
@@ -67,7 +43,6 @@ def calculate_idle_time(tasks):
 
 def calculate_project_duration(tasks):
     return max(task.real_start_time + task.real_duration for task in tasks)
-
 
 def monte_carlo_simulation(task_file, percentile, n_iter, seed):
     """
@@ -130,3 +105,26 @@ def calculate_buffer(durations, planned_duration, percentile_project):
     overruns = np.maximum(0, durations - planned_duration)
     buffer_value = np.percentile(sorted(overruns), percentile_project)
     return buffer_value
+
+def monte_carlo_schedules(task_file, percentile_task, n_iter=100, seed=None):
+    """
+    Запускает Монте-Карло моделирование, возвращает список расписаний (каждое расписание — список Task).
+    """
+    rng = np.random.default_rng(seed)
+    base_tasks = load_tasks_from_csv(task_file)
+
+    seeds = rng.integers(1_000_000, size=n_iter)
+    all_runs = []
+
+    for sim_seed in tqdm(seeds, desc=f"Simulating p={percentile_task}", leave=False):
+        # копируем исходные задачи
+        tasks = copy.deepcopy(base_tasks)
+        for task in tasks:
+            task.reset()
+
+        # строим расписание
+        build_schedule(tasks, percentile=percentile_task, seed=sim_seed)
+
+        all_runs.append(tasks)
+
+    return all_runs
