@@ -1,12 +1,14 @@
 from collections import defaultdict, deque
 from concurrent import futures
 import copy
+
+from services.bayes_rescheduler import reschedule_with_fixed_project_deadline
 from services.critical_path import critical_chain_path, find_critical_path
 from services.parser import load_tasks_from_csv
 from services.scheduler import build_schedule
 from services.metrics import calculate_project_duration, calculate_idle_time, monte_carlo_schedules, monte_carlo_simulation, calculate_buffer, parallel_monte_carlo_simulation
 from services.exporter import export_schedule_to_excel, export_percentile_analysis_to_excel
-from visualization.gantt_chart import plot_gantt
+from visualization.gantt_chart import plot_gantt, plot_replanned_gantt
 from visualization.plot_percentiles_ends_distr import plot_percentile_pdf, plot_percentile_cdfs
 from visualization.plot_idle_vs_duration import plot_idle_vs_duration
 from datetime import datetime
@@ -77,7 +79,7 @@ def part1_2_explore_percentile_effect(percentiles, task_file="data/tasks.csv", n
 
     # собираем все данные
     for p in percentiles:
-        durations, idles = parallel_results[p]
+        durations, idles, _ = parallel_results[p]
         all_durations[p] = durations
 
         avg_duration = np.mean(durations)
@@ -133,7 +135,7 @@ def part1_3_project_buffer(percentile_tasks=0.5, percentile_project=0.9, task_fi
     # planned_duration = max(task.planned_end_time for task in scheduled_tasks)
 
     # 2. Моделирование N проектов
-    durations, _ = monte_carlo_simulation(task_file, percentile_tasks, n_iter, seed)
+    durations, _, _ = monte_carlo_simulation(task_file, percentile_tasks, n_iter, seed, 0)
 
     # 3. t90 — длительность, в которую укладывается 90% проектов
     t_n = calculate_buffer(durations, calculate_project_duration(scheduled_tasks),  percentile_project)
@@ -163,7 +165,7 @@ def part1_4_plot_pareto_idle_vs_duration(percentiles_tasks, task_file="data/task
 
     for p in percentiles_tasks:
         # Прогоняем Монте-Карло
-        mc_durations, mc_idles = parallel_results[p]
+        mc_durations, mc_idles, _ = parallel_results[p]
         
         # Средняя длительность
         avg_duration = np.mean(mc_durations)
@@ -185,7 +187,7 @@ def part1_5_multiple_percentiles(percentiles, task_file="data/tasks.csv", seed=N
     res_dur = []
     parallel_results = parallel_monte_carlo_simulation(task_file, percentiles, 100_000, seed)
     for p in percentiles:
-        durations, _ = parallel_results[p]
+        durations, _, _ = parallel_results[p]
         res_dur.append(durations)
     plot_percentile_pdf(res_dur, percentiles, 'output/plots/project_duration_distributions_multiple_percentiles_pdf.png')
     plot_percentile_cdfs(res_dur, percentiles, 'output/plots/project_duration_distributions_multiple_percentiles_cdf.png')
@@ -199,7 +201,7 @@ def part1_6_plot_heatmaps(task_percentiles, project_percentiles):
     part1_6_3_heatmap_project_buffer(task_percentiles=task_percentiles, project_percentiles=project_percentiles)
 
 def compute_duration_and_buffer(task_file, t_p, p_p, n_sim, seed):
-    sim_durations, _ = monte_carlo_simulation(task_file, t_p, n_sim, seed)
+    sim_durations, _, _ = monte_carlo_simulation(task_file, t_p, n_sim, seed)
     pr_buffer = part1_3_project_buffer(t_p, p_p * 100)
     avg_duration = np.mean(sim_durations)
     return avg_duration, pr_buffer
@@ -225,7 +227,7 @@ def part1_6_1_heatmap_durations(task_file="data/tasks.csv",
 
         for future in tqdm(futures.as_completed(future_to_idx), total=len(future_to_idx), desc="Calculating durations"):
             i, j = future_to_idx[future]
-            avg_duration, pr_buffer = future.result()
+            avg_duration, pr_buffer, _ = future.result()
             durations_matrix[i, j] = avg_duration + pr_buffer
 
     plt.figure(figsize=(10, 6))
@@ -242,13 +244,13 @@ def part1_6_1_heatmap_durations(task_file="data/tasks.csv",
     plt.close()
 
 def compute_avg_idle(task_file, t_p, n_sim, seed):
-    _, idles = monte_carlo_simulation(task_file, t_p, n_sim, seed)
-    ammount = 1
+    _, idles, _ = monte_carlo_simulation(task_file, t_p, n_sim, seed)
+    amount = 1
     summ = 0
     for idle in idles:
         summ += sum(idle.values())
-        ammount += 1
-    avg_idle_sum = summ / ammount
+        amount += 1
+    avg_idle_sum = summ / amount
     return avg_idle_sum
 
 def part1_6_2_heatmap_idles(task_file="data/tasks.csv", 
@@ -351,7 +353,6 @@ def find_critical_path(tasks):
     # Находим критический путь
     critical_path = nx.dag_longest_path(G, weight='duration')
     return critical_path
-
 
 def buffer_penetration_timeline(tasks, project_buffer):
     """
@@ -496,35 +497,196 @@ def buffer_penetration_timeline(tasks, project_buffer):
     plt.savefig("output/plots/buffer_penetration_timeline.png", dpi=300, bbox_inches="tight")
 
 
+def part3_bayesian_replanning(
+    task_file="data/tasks.csv",
+    base_percentile=0.80,
+    progress=None,
+    prior_mean=0.0,
+    prior_std=0.30,
+    obs_noise=0.10,
+    export_plot=True
+):
+    print("______________________________________________________")
+    print(f"part3_bayesian_replanning started at {datetime.now().time()}")
+    print("______________________________________________________")
 
+    if progress is None:
+        progress = {}
 
+    # 1. Исходный базовый план
+    original_tasks = load_tasks_from_csv(task_file)
+    original_tasks = build_schedule(original_tasks, percentile=base_percentile, seed=42)
+
+    target_finish_time = max(task.planned_end_time for task in original_tasks)
+
+    # 2. Перепланирование
+    tasks_for_replanning = load_tasks_from_csv(task_file)
+
+    result = reschedule_with_fixed_project_deadline(
+        tasks=tasks_for_replanning,
+        progress=progress,
+        target_finish_time=target_finish_time,
+        current_time=None,   # будет восстановлено автоматически из completed-задач
+        base_percentile=base_percentile,
+        prior_mean=prior_mean,
+        prior_std=prior_std,
+        obs_noise=obs_noise
+    )
+
+    replanned_tasks = result["tasks"]
+
+    print("Использовано завершённых задач:", result["used_observations"])
+    print("Оценка коэффициента смещения:", round(result["bias_factor_mean"], 4))
+    print("Использованный percentile:", round(result["used_percentile"], 4))
+    print("Текущее реконструированное время:", round(result["current_time"], 4))
+    print("Ожидаемый срок проекта:", round(result["project_finish"], 4))
+    print("Дедлайн сохранён:", result["deadline_met"])
+    print("Комментарий:", result["message"])
+
+    if export_plot:
+        plot_replanned_gantt(
+            original_tasks=original_tasks,
+            replanned_tasks=replanned_tasks,
+            filename="output/plots/replanned_gantt.png",
+            target_finish_time=target_finish_time
+        )
+
+    return result
 
 
 if __name__ == "__main__":
-    PERCENTILE_TASK = 0.2
-    PERCENTILE_PROJECT = 0.6
+    PERCENTILE_TASK = 0.5
+    PERCENTILE_PROJECT = 0.9
     PERCENTILES_RANGE = np.arange(0.05, 0.96, 0.05)
     # PERCENTILES_RANGE = [0.1, 0.5, 0.9]
     PERCENTILES_FOR_PLOT = [0.1, 0.5, 0.9]
 
-    print("______________________________________________________")
-    print(f"Started at {datetime.now().time()}")
-    print("______________________________________________________")
-    
-    # # Нахождение буфера проекта
-    pr_buffer = part1_3_project_buffer(percentile_tasks=PERCENTILE_TASK, percentile_project=PERCENTILE_PROJECT * 100)
+    # print("______________________________________________________")
+    # print(f"Started at {datetime.now().time()}")
+    # print("______________________________________________________")
+    #
+    # # # Нахождение буфера проекта
+    # pr_buffer = part1_3_project_buffer(percentile_tasks=PERCENTILE_TASK, percentile_project=PERCENTILE_PROJECT * 100)
     # # print(pr_buffer)
-    # # # pr_buffer = 0
-    # # # Расчет задач, построение диаграммы Гантта, экспорт таблицы задач
-    scheduled_tasks, _, _ = part1_1_schedule_project(pr_buffer, percentile=PERCENTILE_TASK)
+    # # pr_buffer = 0
+    # # Расчет задач, построение диаграммы Гантта, экспорт таблицы задач
+    # scheduled_tasks, _, _ = part1_1_schedule_project(pr_buffer, percentile=PERCENTILE_TASK)
     # # Построение графиков кумулятивных функций распределения и плотности вероятности
     # part1_2_explore_percentile_effect(percentiles=PERCENTILES_RANGE)
     # # Построение Парето графика (Простои-Длительность для разных процентилей задач)
     # part1_4_plot_pareto_idle_vs_duration(PERCENTILES_RANGE)
     # # Построение графика плотности вероятности с разными процентилями
     # part1_5_multiple_percentiles(PERCENTILES_FOR_PLOT)
-    # # Тепловые карты по длительности, 
+    # # Тепловые карты по длительности,
     # part1_6_plot_heatmaps(task_percentiles=PERCENTILES_RANGE, project_percentiles=PERCENTILES_RANGE)
+    #
+    # # buffer_penetration_timeline(scheduled_tasks, pr_buffer)
 
-    buffer_penetration_timeline(scheduled_tasks, pr_buffer)
+    progress_example_long = {
+        1: {"status": "done", "actual_duration": 3.0},
+        2: {"status": "done", "actual_duration": 9.0},
+        3: {"status": "done", "actual_duration": 12.0},
+        4: {"status": "done", "actual_duration": 6.0},
+        5: {"status": "done", "actual_duration": 7.5},
+        6: {"status": "done", "actual_duration": 5.25},
+        7: {"status": "done", "actual_duration": 15.0},
+        8: {"status": "done", "actual_duration": 18.0},
+        9: {"status": "done", "actual_duration": 12.0},
+        10: {"status": "done", "actual_duration": 9.0},
+        11: {"status": "done", "actual_duration": 7.5},
+        12: {"status": "done", "actual_duration": 9.0},
+        13: {"status": "done", "actual_duration": 10.5},
+        14: {"status": "done", "actual_duration": 12.0},
+        15: {"status": "done", "actual_duration": 15.0},
+
+        16: {"status": "not_started"},
+        17: {"status": "not_started"},
+        18: {"status": "not_started"},
+        19: {"status": "not_started"},
+        20: {"status": "not_started"},
+        21: {"status": "not_started"},
+        22: {"status": "not_started"},
+        23: {"status": "not_started"},
+        24: {"status": "not_started"},
+        25: {"status": "not_started"},
+        26: {"status": "not_started"},
+        27: {"status": "not_started"},
+        28: {"status": "not_started"},
+        29: {"status": "not_started"},
+        30: {"status": "not_started"},
+        31: {"status": "not_started"},
+        32: {"status": "not_started"},
+        33: {"status": "not_started"},
+        34: {"status": "not_started"},
+        35: {"status": "not_started"},
+        36: {"status": "not_started"},
+        37: {"status": "not_started"},
+        38: {"status": "not_started"},
+        39: {"status": "not_started"},
+        40: {"status": "not_started"},
+        41: {"status": "not_started"},
+        42: {"status": "not_started"},
+        43: {"status": "not_started"},
+        44: {"status": "not_started"},
+        45: {"status": "not_started"},
+    }
+
+    progress_example_short = {
+        1: {"status": "done", "actual_duration": 1.33},
+        2: {"status": "done", "actual_duration": 4.0},
+        3: {"status": "done", "actual_duration": 5.33},
+        4: {"status": "done", "actual_duration": 2.67},
+        5: {"status": "done", "actual_duration": 3.33},
+        6: {"status": "done", "actual_duration": 2.33},
+        7: {"status": "done", "actual_duration": 6.67},
+        8: {"status": "done", "actual_duration": 8.0},
+        9: {"status": "done", "actual_duration": 5.33},
+        10: {"status": "done", "actual_duration": 4.0},
+        11: {"status": "done", "actual_duration": 3.33},
+        12: {"status": "done", "actual_duration": 4.0},
+        13: {"status": "done", "actual_duration": 4.67},
+        14: {"status": "done", "actual_duration": 5.33},
+        15: {"status": "done", "actual_duration": 6.67},
+
+        16: {"status": "not_started"},
+        17: {"status": "not_started"},
+        18: {"status": "not_started"},
+        19: {"status": "not_started"},
+        20: {"status": "not_started"},
+        21: {"status": "not_started"},
+        22: {"status": "not_started"},
+        23: {"status": "not_started"},
+        24: {"status": "not_started"},
+        25: {"status": "not_started"},
+        26: {"status": "not_started"},
+        27: {"status": "not_started"},
+        28: {"status": "not_started"},
+        29: {"status": "not_started"},
+        30: {"status": "not_started"},
+        31: {"status": "not_started"},
+        32: {"status": "not_started"},
+        33: {"status": "not_started"},
+        34: {"status": "not_started"},
+        35: {"status": "not_started"},
+        36: {"status": "not_started"},
+        37: {"status": "not_started"},
+        38: {"status": "not_started"},
+        39: {"status": "not_started"},
+        40: {"status": "not_started"},
+        41: {"status": "not_started"},
+        42: {"status": "not_started"},
+        43: {"status": "not_started"},
+        44: {"status": "not_started"},
+        45: {"status": "not_started"},
+    }
+
+    result = part3_bayesian_replanning(
+        task_file="data/tasks.csv",
+        base_percentile=PERCENTILE_TASK,
+        progress=progress_example_long,
+        prior_mean=0.0,
+        prior_std=0.30,
+        obs_noise=0.10,
+        export_plot=True
+    )
 
