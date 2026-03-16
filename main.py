@@ -555,7 +555,7 @@ def part3_bayesian_replanning(
 
 
 if __name__ == "__main__":
-    PERCENTILE_TASK = 0.5
+    PERCENTILE_TASK = 0.9
     PERCENTILE_PROJECT = 0.9
     PERCENTILES_RANGE = np.arange(0.05, 0.96, 0.05)
     # PERCENTILES_RANGE = [0.1, 0.5, 0.9]
@@ -595,16 +595,17 @@ if __name__ == "__main__":
         10: {"status": "done", "actual_duration": 9.0},
         11: {"status": "done", "actual_duration": 7.5},
         12: {"status": "done", "actual_duration": 9.0},
-        13: {"status": "done", "actual_duration": 10.5},
-        14: {"status": "done", "actual_duration": 12.0},
-        15: {"status": "done", "actual_duration": 15.0},
+        19: {"status": "done", "actual_duration": 9.0},
+        20: {"status": "done", "actual_duration": 15.0},
+        21: {"status": "done", "actual_duration": 12.0},
 
+        13: {"status": "not_started"},
+        14: {"status": "not_started"},
+        15: {"status": "not_started"},
         16: {"status": "not_started"},
         17: {"status": "not_started"},
         18: {"status": "not_started"},
-        19: {"status": "not_started"},
-        20: {"status": "not_started"},
-        21: {"status": "not_started"},
+
         22: {"status": "not_started"},
         23: {"status": "not_started"},
         24: {"status": "not_started"},
@@ -644,16 +645,17 @@ if __name__ == "__main__":
         10: {"status": "done", "actual_duration": 4.0},
         11: {"status": "done", "actual_duration": 3.33},
         12: {"status": "done", "actual_duration": 4.0},
-        13: {"status": "done", "actual_duration": 4.67},
-        14: {"status": "done", "actual_duration": 5.33},
-        15: {"status": "done", "actual_duration": 6.67},
+        19: {"status": "done", "actual_duration": 4},
+        20: {"status": "done", "actual_duration": 6.67},
+        21: {"status": "done", "actual_duration": 5.33},
 
+        13: {"status": "not_started"},
+        14: {"status": "not_started"},
+        15: {"status": "not_started"},
         16: {"status": "not_started"},
         17: {"status": "not_started"},
         18: {"status": "not_started"},
-        19: {"status": "not_started"},
-        20: {"status": "not_started"},
-        21: {"status": "not_started"},
+
         22: {"status": "not_started"},
         23: {"status": "not_started"},
         24: {"status": "not_started"},
