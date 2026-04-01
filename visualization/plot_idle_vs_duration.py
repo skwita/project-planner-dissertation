@@ -89,3 +89,128 @@ def plot_idle_vs_duration(durations, idles_sum, percentiles_tasks, n_iter, save_
     plt.close()
 
     print(f"График сохранен в {save_path}")
+
+def plot_pareto_transition(
+    durations_base,
+    idles_base,
+    durations_new,
+    idles_new,
+    percentiles,
+    deadline,
+    save_path
+):
+    """
+    Визуализация перехода решения на Парето-кривой:
+    - исходная кривая
+    - новая кривая после смещения
+    - стрелка перехода решения
+    """
+
+    plt.figure(figsize=(9, 7))
+
+    # --- массивы ---
+    d0 = np.array(durations_base)
+    i0 = np.array(idles_base)
+
+    d1 = np.array(durations_new)
+    i1 = np.array(idles_new)
+
+    percentiles = np.array(percentiles)
+
+    # --- 1. исходная кривая ---
+    plt.scatter(d0, i0, c=percentiles, cmap='Blues',
+                s=70, edgecolors='black', label="Исходная")
+
+    # --- 2. новая кривая ---
+    plt.scatter(d1, i1, c=percentiles, cmap='Greens',
+                s=70, edgecolors='black', label="После переоценки")
+
+    # --- линия дедлайна ---
+    plt.axvline(deadline, linestyle='--', color='red', linewidth=2, label="Дедлайн")
+
+    # --- 3. исходное решение (ближайшее к дедлайну слева) ---
+    mask0 = d0 <= deadline
+    idx0 = np.argmax(d0[mask0])
+    x0 = d0[mask0][idx0]
+    y0 = i0[mask0][idx0]
+
+    # --- 4. новое решение ---
+    mask1 = d1 <= deadline
+    idx1 = np.argmax(d1[mask1])
+    x1 = d1[mask1][idx1]
+    y1 = i1[mask1][idx1]
+
+    # --- выделение точек ---
+    plt.scatter(x0, y0, color='blue', s=140, zorder=5)
+    plt.scatter(x1, y1, color='green', s=140, zorder=5)
+
+    # --- стрелка перехода ---
+    plt.arrow(
+        x0, y0,
+        x1 - x0, y1 - y0,
+        head_width=0.5,
+        length_includes_head=True,
+        color='black',
+        linewidth=2
+    )
+
+    # --- подписи ---
+    plt.text(x0, y0, "старый план", fontsize=10, color='blue')
+    plt.text(x1, y1, "новый план", fontsize=10, color='green')
+
+    # --- подписи процентилей ---
+    for i, p in enumerate(percentiles):
+        plt.text(d1[i] + 0.3, i1[i] + 0.3, f"{p:.2f}", fontsize=7)
+
+    plt.xlabel("Длительность проекта")
+    plt.ylabel("Суммарный простой")
+    plt.title("Переход решения на Парето-фронте при переоценке")
+
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.5)
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300)
+    plt.close()
+
+    print(f"График перехода сохранен в {save_path}")
+
+def plot_history_metrics(history, save_prefix="output/plots/history"):
+    import matplotlib.pyplot as plt
+
+    stages = [h["stage"] for h in history]
+    bias = [h["bias"] for h in history]
+    percentile = [h["percentile"] for h in history]
+    finish = [h["finish"] for h in history]
+
+    # --- 1. Смещение ---
+    plt.figure()
+    plt.plot(stages, bias, marker='o')
+    plt.xlabel("Этап")
+    plt.ylabel("Смещение (bias)")
+    plt.title("Динамика смещения")
+    plt.grid(True)
+    plt.savefig(f"{save_prefix}_bias.png", dpi=300)
+    plt.close()
+
+    # --- 2. Percentile ---
+    plt.figure()
+    plt.plot(stages, percentile, marker='o')
+    plt.xlabel("Этап")
+    plt.ylabel("Percentile")
+    plt.title("Динамика процентиля")
+    plt.grid(True)
+    plt.savefig(f"{save_prefix}_percentile.png", dpi=300)
+    plt.close()
+
+    # --- 3. Срок проекта ---
+    plt.figure()
+    plt.plot(stages, finish, marker='o')
+    plt.xlabel("Этап")
+    plt.ylabel("Срок проекта")
+    plt.title("Динамика срока проекта")
+    plt.grid(True)
+    plt.savefig(f"{save_prefix}_finish.png", dpi=300)
+    plt.close()
+
+    print("Графики сохранены")

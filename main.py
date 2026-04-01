@@ -10,7 +10,8 @@ from services.metrics import calculate_project_duration, calculate_idle_time, mo
 from services.exporter import export_schedule_to_excel, export_percentile_analysis_to_excel
 from visualization.gantt_chart import plot_gantt, plot_replanned_gantt
 from visualization.plot_percentiles_ends_distr import plot_percentile_pdf, plot_percentile_cdfs
-from visualization.plot_idle_vs_duration import plot_idle_vs_duration
+from visualization.plot_idle_vs_duration import plot_idle_vs_duration, plot_history_metrics
+from visualization.plot_idle_vs_duration import plot_pareto_transition
 from datetime import datetime
 from tqdm import tqdm
 import seaborn as sns
@@ -553,6 +554,83 @@ def part3_bayesian_replanning(
 
     return result
 
+def part4_multistage_replanning_iterative(
+    full_progress,
+    task_file="data/tasks.csv",
+    base_percentile=0.8,
+    batch_size=5,
+    prior_mean=0.0,
+    prior_std=0.3,
+    obs_noise=0.1,
+    export_gantts=False
+):
+    print("______________________________________________________")
+    print(f"iterative replanning started at {datetime.now().time()}")
+    print("______________________________________________________")
+
+    # --- 1. стартовый план ---
+    current_tasks = load_tasks_from_csv(task_file)
+    current_tasks = build_schedule(current_tasks, percentile=base_percentile, seed=42)
+
+    target_finish_time = max(t.planned_end_time for t in current_tasks)
+
+    # порядок поступления факта
+    ordered_task_ids = [
+        t.task_id for t in sorted(current_tasks, key=lambda x: x.planned_end_time)
+    ]
+
+    observed_progress = {}
+    history = []
+
+    # --- 2. итерации ---
+    for i in range(0, len(ordered_task_ids), batch_size):
+        batch_ids = ordered_task_ids[i:i+batch_size]
+
+        print(f"\n=== ЭТАП {i//batch_size + 1} ===")
+
+        # --- добавляем новые факты ---
+        for task_id in batch_ids:
+            if task_id in full_progress:
+                observed_progress[task_id] = full_progress[task_id]
+
+        print("доступные задачи:", sorted(observed_progress.keys()))
+
+        # --- ключевой момент: используем current_tasks ---
+        result = reschedule_with_fixed_project_deadline(
+            tasks=current_tasks,   # ← ВАЖНО
+            progress=observed_progress,
+            target_finish_time=target_finish_time,
+            current_time=None,
+            base_percentile=base_percentile,
+            prior_mean=prior_mean,
+            prior_std=prior_std,
+            obs_noise=obs_noise
+        )
+
+        current_tasks = result["tasks"]   # ← ВАЖНО (итеративность)
+
+        print("смещение:", round(result["bias_factor_mean"], 3))
+        print("percentile:", round(result["used_percentile"], 3))
+        print("срок:", round(result["project_finish"], 2))
+
+        history.append({
+            "stage": i // batch_size + 1,
+            "completed": len(observed_progress),
+            "bias": result["bias_factor_mean"],
+            "percentile": result["used_percentile"],
+            "finish": result["project_finish"]
+        })
+
+        if export_gantts:
+            plot_replanned_gantt(
+                original_tasks=current_tasks,
+                replanned_tasks=current_tasks,
+                filename=f"output/plots/replanned_stage_{i//batch_size+1}.png",
+                target_finish_time=target_finish_time
+            )
+
+    return history
+
 
 if __name__ == "__main__":
     PERCENTILE_TASK = 0.9
@@ -593,35 +671,33 @@ if __name__ == "__main__":
         8: {"status": "done", "actual_duration": 18.0},
         9: {"status": "done", "actual_duration": 12.0},
         10: {"status": "done", "actual_duration": 9.0},
-        11: {"status": "done", "actual_duration": 7.5},
-        12: {"status": "done", "actual_duration": 9.0},
         19: {"status": "done", "actual_duration": 9.0},
-        20: {"status": "done", "actual_duration": 15.0},
         21: {"status": "done", "actual_duration": 12.0},
-
+        11: {"status": "done", "actual_duration": 7.5},
+        20: {"status": "done", "actual_duration": 15.0},
+        12: {"status": "done", "actual_duration": 9.0},
         13: {"status": "not_started"},
         14: {"status": "not_started"},
         15: {"status": "not_started"},
         16: {"status": "not_started"},
         17: {"status": "not_started"},
-        18: {"status": "not_started"},
-
         22: {"status": "not_started"},
+        18: {"status": "not_started"},
         23: {"status": "not_started"},
         24: {"status": "not_started"},
         25: {"status": "not_started"},
+        29: {"status": "not_started"},
         26: {"status": "not_started"},
         27: {"status": "not_started"},
         28: {"status": "not_started"},
-        29: {"status": "not_started"},
-        30: {"status": "not_started"},
         31: {"status": "not_started"},
+        30: {"status": "not_started"},
         32: {"status": "not_started"},
         33: {"status": "not_started"},
         34: {"status": "not_started"},
         35: {"status": "not_started"},
-        36: {"status": "not_started"},
         37: {"status": "not_started"},
+        36: {"status": "not_started"},
         38: {"status": "not_started"},
         39: {"status": "not_started"},
         40: {"status": "not_started"},
@@ -648,14 +724,12 @@ if __name__ == "__main__":
         19: {"status": "done", "actual_duration": 4},
         20: {"status": "done", "actual_duration": 6.67},
         21: {"status": "done", "actual_duration": 5.33},
-
         13: {"status": "not_started"},
         14: {"status": "not_started"},
         15: {"status": "not_started"},
         16: {"status": "not_started"},
         17: {"status": "not_started"},
         18: {"status": "not_started"},
-
         22: {"status": "not_started"},
         23: {"status": "not_started"},
         24: {"status": "not_started"},
@@ -682,6 +756,108 @@ if __name__ == "__main__":
         45: {"status": "not_started"},
     }
 
+    progress_example_wave = { # 1.5/0.5
+        1: {"status": "done", "actual_duration": 3.0},
+        2: {"status": "done", "actual_duration": 9.0},
+        3: {"status": "done", "actual_duration": 12.0},
+        4: {"status": "done", "actual_duration": 6.0},
+        5: {"status": "done", "actual_duration": 7.5},
+        6: {"status": "done", "actual_duration": 5.25},
+        7: {"status": "done", "actual_duration": 15.0},
+        8: {"status": "done", "actual_duration": 8.0},
+        9: {"status": "done", "actual_duration": 5.33},
+        10: {"status": "done", "actual_duration": 4.0},
+        11: {"status": "done", "actual_duration": 3.33},
+        12: {"status": "done", "actual_duration": 4.0},
+        13: {"status": "done", "actual_duration": 4.67},
+        14: {"status": "done", "actual_duration": 5.33},
+        15: {"status": "done", "actual_duration": 15.0},
+        16: {"status": "done", "actual_duration": 18.0},
+        17: {"status": "done", "actual_duration": 12.0},
+        18: {"status": "done", "actual_duration": 6.0},
+        19: {"status": "done", "actual_duration": 9.0},
+        20: {"status": "done", "actual_duration": 15.0},
+        21: {"status": "done", "actual_duration": 12.0},
+        22: {"status": "done", "actual_duration": 6.67},
+        23: {"status": "done", "actual_duration": 4.0},
+        24: {"status": "done", "actual_duration": 6.67},
+        25: {"status": "done", "actual_duration": 5.33},
+        26: {"status": "done", "actual_duration": 8.0},
+        27: {"status": "done", "actual_duration": 6.67},
+        28: {"status": "done", "actual_duration": 4.0},
+        29: {"status": "done", "actual_duration": 10.5},
+        30: {"status": "done", "actual_duration": 15.0},
+        31: {"status": "done", "actual_duration": 12.0},
+        32: {"status": "done", "actual_duration": 12.0},
+        33: {"status": "done", "actual_duration": 10.5},
+        34: {"status": "done", "actual_duration": 15.0},
+        35: {"status": "done", "actual_duration": 7.5},
+        36: {"status": "done", "actual_duration": 4.0},
+        37: {"status": "done", "actual_duration": 4.67},
+        38: {"status": "done", "actual_duration": 4.0},
+        39: {"status": "done", "actual_duration": 3.33},
+        40: {"status": "done", "actual_duration": 2.0},
+        41: {"status": "done", "actual_duration": 6.67},
+        42: {"status": "done", "actual_duration": 9.33},
+        43: {"status": "done", "actual_duration": 7.5},
+        44: {"status": "done", "actual_duration": 10.5},
+        45: {"status": "done", "actual_duration": 6.0},
+    }
+
+    progress_example_wave_worse = {
+        1: {"status": "done", "actual_duration": 3.0},
+        2: {"status": "done", "actual_duration": 9.0},
+        3: {"status": "done", "actual_duration": 12.0},
+        4: {"status": "done", "actual_duration": 6.0},
+        5: {"status": "done", "actual_duration": 7.5},
+        6: {"status": "done", "actual_duration": 5.25},
+        7: {"status": "done", "actual_duration": 15.0},
+
+        8: {"status": "done", "actual_duration": 14.4},
+        9: {"status": "done", "actual_duration": 9.6},
+        10: {"status": "done", "actual_duration": 7.2},
+        11: {"status": "done", "actual_duration": 6.0},
+        12: {"status": "done", "actual_duration": 7.2},
+        13: {"status": "done", "actual_duration": 8.4},
+        14: {"status": "done", "actual_duration": 9.6},
+
+        15: {"status": "done", "actual_duration": 15.0},
+        16: {"status": "done", "actual_duration": 18.0},
+        17: {"status": "done", "actual_duration": 12.0},
+        18: {"status": "done", "actual_duration": 6.0},
+        19: {"status": "done", "actual_duration": 9.0},
+        20: {"status": "done", "actual_duration": 15.0},
+        21: {"status": "done", "actual_duration": 12.0},
+
+        22: {"status": "done", "actual_duration": 12.0},
+        23: {"status": "done", "actual_duration": 7.2},
+        24: {"status": "done", "actual_duration": 12.0},
+        25: {"status": "done", "actual_duration": 9.6},
+        26: {"status": "done", "actual_duration": 14.4},
+        27: {"status": "done", "actual_duration": 12.0},
+        28: {"status": "done", "actual_duration": 7.2},
+
+        29: {"status": "done", "actual_duration": 10.5},
+        30: {"status": "done", "actual_duration": 15.0},
+        31: {"status": "done", "actual_duration": 12.0},
+        32: {"status": "done", "actual_duration": 12.0},
+        33: {"status": "done", "actual_duration": 10.5},
+        34: {"status": "done", "actual_duration": 15.0},
+        35: {"status": "done", "actual_duration": 7.5},
+
+        36: {"status": "done", "actual_duration": 7.2},
+        37: {"status": "done", "actual_duration": 8.4},
+        38: {"status": "done", "actual_duration": 7.2},
+        39: {"status": "done", "actual_duration": 6.0},
+        40: {"status": "done", "actual_duration": 3.6},
+        41: {"status": "done", "actual_duration": 12.0},
+        42: {"status": "done", "actual_duration": 16.8},
+
+        43: {"status": "done", "actual_duration": 7.5},
+        44: {"status": "done", "actual_duration": 10.5},
+        45: {"status": "done", "actual_duration": 6.0},
+    }
+
     result = part3_bayesian_replanning(
         task_file="data/tasks.csv",
         base_percentile=PERCENTILE_TASK,
@@ -692,3 +868,15 @@ if __name__ == "__main__":
         export_plot=True
     )
 
+    history = part4_multistage_replanning_iterative(
+        full_progress=progress_example_wave_worse,
+        task_file="data/tasks.csv",
+        base_percentile=0.9,
+        batch_size=2,
+        prior_mean=0.0,
+        prior_std=0.30,
+        obs_noise=0.10,
+        export_gantts=True
+    )
+
+    plot_history_metrics(history)
