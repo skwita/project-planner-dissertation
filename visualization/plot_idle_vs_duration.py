@@ -1,216 +1,191 @@
+"""Pareto scatter plot: average project duration vs. average idle time."""
+
 import matplotlib.pyplot as plt
 import numpy as np
 from scipy.optimize import curve_fit
 
-def exp_func(x, a, b, c):
-    """Экспоненциальная аппроксимация"""
-    return a * np.exp(b * x) + c
-def hyp_func(x, a, b, c):
-    """Экспоненциальная аппроксимация"""
+
+def _hyperbolic(x: np.ndarray, a: float, b: float, c: float) -> np.ndarray:
+    """Hyperbolic curve: a / (x - b) + c."""
     return a / (x - b) + c
 
-def plot_idle_vs_duration(durations, idles_sum, percentiles_tasks, n_iter, save_path, max_duration=None):
+
+def plot_idle_vs_duration(
+    durations: list[float],
+    idles_sum: list[float],
+    percentiles_tasks: list[float],
+    n_iter: int,
+    save_path: str,
+    max_duration: float | None = None,
+) -> None:
     """
-    Рисует график Парето: средняя длительность проекта vs средний суммарный простой.
-    
-    :param durations: список средних длительностей проекта
-    :param idles_sum: список средних суммарных простоев
-    :param percentiles_tasks: список процентилей задач
-    :param n_iter: количество итераций Монте-Карло
-    :param save_path: путь для сохранения картинки
-    :param max_duration: если указан, рисуется вертикальная линия, а точки правее неё становятся серыми и прозрачными
+    Pareto scatter: mean project duration (x) vs. mean total idle time (y).
+
+    Each point is labelled with its task percentile (as an integer, e.g. 50).
+    Points are colour-coded by percentile.  When ``max_duration`` is given,
+    points to the right of that threshold are shown as grey/transparent and
+    a vertical deadline line is drawn.
+
+    A hyperbolic curve fit is attempted; the result is currently not plotted
+    (uncomment the ``plt.plot`` line below to enable it).
+
+    Args:
+        durations:        Mean project duration per percentile.
+        idles_sum:        Mean total idle time per percentile.
+        percentiles_tasks: Percentile values matching the two lists above.
+        n_iter:           Number of MC iterations (shown in the title).
+        save_path:        Output image path.
+        max_duration:     Optional deadline for colour-splitting the scatter.
     """
     plt.figure(figsize=(8, 6))
 
-    np_durations = np.array(durations)
-    np_idles_sum = np.array(idles_sum)
-    percentiles_tasks = np.array(percentiles_tasks)
+    np_dur = np.array(durations)
+    np_idle = np.array(idles_sum)
+    np_pct = np.array(percentiles_tasks)
 
-    # --- Если max_duration задан, разделяем точки ---
     if max_duration is not None:
-        mask_right = np_durations > max_duration    # точки правее
-        mask_left = ~mask_right                  # точки слева или на линии
-
-        # обычные точки (левые)
-        scatter_left = plt.scatter(
-            np_durations[mask_left], np_idles_sum[mask_left],
-            c=percentiles_tasks[mask_left], cmap='viridis',
-            s=80, edgecolors='black'
-        )
-
-        # серые полупрозрачные точки (правые)
-        scatter_right = plt.scatter(
-            np_durations[mask_right], np_idles_sum[mask_right],
-            color='gray', alpha=0.4,
-            s=80, edgecolors='black'
-        )
-
-        # цветовая шкала — только для левых точек
-        cbar = plt.colorbar(scatter_left)
-        cbar.set_label("Процентиль задач")
-
-        # вертикальная линия
-        plt.axvline(max_duration, linestyle='--', color='red', linewidth=1.5)
-
+        mask = np_dur <= max_duration
+        sc = plt.scatter(np_dur[mask], np_idle[mask],
+                         c=np_pct[mask], cmap="viridis",
+                         s=80, edgecolors="black")
+        plt.scatter(np_dur[~mask], np_idle[~mask],
+                    color="gray", alpha=0.4, s=80, edgecolors="black")
+        cbar = plt.colorbar(sc)
+        plt.axvline(max_duration, linestyle="--", color="red", linewidth=1.5)
     else:
-        # обычный scatter
-        scatter = plt.scatter(
-            np_durations, np_idles_sum,
-            c=percentiles_tasks, cmap='viridis',
-            s=80, edgecolors='black'
-        )
-        cbar = plt.colorbar(scatter)
-        cbar.set_label("Процентиль задач")
+        sc = plt.scatter(np_dur, np_idle,
+                         c=np_pct, cmap="viridis",
+                         s=80, edgecolors="black")
+        cbar = plt.colorbar(sc)
 
-    # --- Экспоненциальная аппроксимация ---
+    cbar.set_label("Task percentile")
+
+    # Attempt hyperbolic fit (for diagnostics; not plotted by default)
     try:
-        popt, _ = curve_fit(hyp_func, durations, idles_sum, p0=(1, 0.01, 1), maxfev=10000)
-        print(f"⚙️ Параметры аппроксимации: a={popt[0]:.4f}, b={popt[1]:.4f}, c={popt[2]:.4f}")
-        x_fit = np.linspace(min(np_durations), max(np_durations), 300)
-        y_fit = hyp_func(x_fit, *popt)
-        # plt.plot(x_fit, y_fit, "r--", linewidth=2, label="Экспоненциальная аппроксимация")
+        popt, _ = curve_fit(_hyperbolic, durations, idles_sum,
+                            p0=(1.0, 0.01, 1.0), maxfev=10_000)
+        print(f"Fit params: a={popt[0]:.4f}, b={popt[1]:.4f}, c={popt[2]:.4f}")
+        # x_fit = np.linspace(np_dur.min(), np_dur.max(), 300)
+        # plt.plot(x_fit, _hyperbolic(x_fit, *popt), "r--", linewidth=2)
     except RuntimeError:
-        print("⚠️ Не удалось выполнить экспоненциальную аппроксимацию")
-    # --------------------------------------
+        print("⚠  Hyperbolic fit did not converge.")
 
-    # Подписи точек
-    for i, p in enumerate(percentiles_tasks):
-        dx = 0.3
-        dy = 0.3
-        plt.text(np_durations[i] + dx, np_idles_sum[i] + dy, f"{p * 100:.0f}", fontsize=8)
+    # Point labels (percentile as integer %)
+    for i, p in enumerate(np_pct):
+        plt.text(np_dur[i] + 0.3, np_idle[i] + 0.3, f"{p * 100:.0f}", fontsize=8)
 
-    plt.xlabel("Средняя длительность проекта (дни)")
-    plt.ylabel("Средний суммарный простой (дни)")
-    plt.title(f"Pareto: простои vs длительность ({n_iter} итераций)")
-
+    plt.xlabel("Mean project duration (days)")
+    plt.ylabel("Mean total idle time (days)")
+    plt.title(f"Pareto: idle time vs. duration  ({n_iter:,} iterations)")
     plt.grid(True, linestyle="--", alpha=0.5)
     plt.tight_layout()
     plt.savefig(save_path, dpi=300)
     plt.close()
+    print(f"Saved: {save_path}")
 
-    print(f"График сохранен в {save_path}")
 
 def plot_pareto_transition(
-    durations_base,
-    idles_base,
-    durations_new,
-    idles_new,
-    percentiles,
-    deadline,
-    save_path
-):
+    durations_base: list[float],
+    idles_base: list[float],
+    durations_new: list[float],
+    idles_new: list[float],
+    percentiles: list[float],
+    deadline: float,
+    save_path: str,
+) -> None:
     """
-    Визуализация перехода решения на Парето-кривой:
-    - исходная кривая
-    - новая кривая после смещения
-    - стрелка перехода решения
-    """
+    Show how the optimal operating point shifts on the Pareto front after
+    Bayesian bias correction.
 
+    Two scatter clouds are drawn (original vs. updated predictive
+    distributions), the feasible region is delimited by a deadline line,
+    and an arrow connects the old optimal point to the new one.
+
+    Args:
+        durations_base:  Mean project durations before replanning.
+        idles_base:      Mean idle times before replanning.
+        durations_new:   Mean project durations after replanning.
+        idles_new:       Mean idle times after replanning.
+        percentiles:     Task percentiles corresponding to each point.
+        deadline:        Hard deadline (vertical line).
+        save_path:       Output image path.
+    """
     plt.figure(figsize=(9, 7))
 
-    # --- массивы ---
-    d0 = np.array(durations_base)
-    i0 = np.array(idles_base)
+    np_pct = np.array(percentiles)
+    d0, i0 = np.array(durations_base), np.array(idles_base)
+    d1, i1 = np.array(durations_new), np.array(idles_new)
 
-    d1 = np.array(durations_new)
-    i1 = np.array(idles_new)
+    plt.scatter(d0, i0, c=np_pct, cmap="Blues",
+                s=70, edgecolors="black", label="Original")
+    plt.scatter(d1, i1, c=np_pct, cmap="Greens",
+                s=70, edgecolors="black", label="After bias update")
+    plt.axvline(deadline, linestyle="--", color="red",
+                linewidth=2, label="Deadline")
 
-    percentiles = np.array(percentiles)
+    # Optimal point: rightmost feasible point on each curve
+    def _optimal(durations: np.ndarray, idles: np.ndarray) -> tuple[float, float]:
+        mask = durations <= deadline
+        idx = np.where(mask)[0][np.argmax(durations[mask])] if mask.any() else int(np.argmin(durations))
+        return float(durations[idx]), float(idles[idx])
 
-    # --- 1. исходная кривая ---
-    plt.scatter(d0, i0, c=percentiles, cmap='Blues',
-                s=70, edgecolors='black', label="Исходная")
+    x0, y0 = _optimal(d0, i0)
+    x1, y1 = _optimal(d1, i1)
 
-    # --- 2. новая кривая ---
-    plt.scatter(d1, i1, c=percentiles, cmap='Greens',
-                s=70, edgecolors='black', label="После переоценки")
+    plt.scatter(x0, y0, color="blue", s=140, zorder=5)
+    plt.scatter(x1, y1, color="green", s=140, zorder=5)
+    plt.annotate("", xy=(x1, y1), xytext=(x0, y0),
+                 arrowprops=dict(arrowstyle="->", color="black", lw=2))
+    plt.text(x0 + 0.2, y0 + 0.2, "old plan", fontsize=10, color="blue")
+    plt.text(x1 + 0.2, y1 + 0.2, "new plan", fontsize=10, color="green")
 
-    # --- линия дедлайна ---
-    plt.axvline(deadline, linestyle='--', color='red', linewidth=2, label="Дедлайн")
-
-    # --- 3. исходное решение (ближайшее к дедлайну слева) ---
-    mask0 = d0 <= deadline
-    idx0 = np.argmax(d0[mask0])
-    x0 = d0[mask0][idx0]
-    y0 = i0[mask0][idx0]
-
-    # --- 4. новое решение ---
-    mask1 = d1 <= deadline
-    idx1 = np.argmax(d1[mask1])
-    x1 = d1[mask1][idx1]
-    y1 = i1[mask1][idx1]
-
-    # --- выделение точек ---
-    plt.scatter(x0, y0, color='blue', s=140, zorder=5)
-    plt.scatter(x1, y1, color='green', s=140, zorder=5)
-
-    # --- стрелка перехода ---
-    plt.arrow(
-        x0, y0,
-        x1 - x0, y1 - y0,
-        head_width=0.5,
-        length_includes_head=True,
-        color='black',
-        linewidth=2
-    )
-
-    # --- подписи ---
-    plt.text(x0, y0, "старый план", fontsize=10, color='blue')
-    plt.text(x1, y1, "новый план", fontsize=10, color='green')
-
-    # --- подписи процентилей ---
-    for i, p in enumerate(percentiles):
+    for i, p in enumerate(np_pct):
         plt.text(d1[i] + 0.3, i1[i] + 0.3, f"{p:.2f}", fontsize=7)
 
-    plt.xlabel("Длительность проекта")
-    plt.ylabel("Суммарный простой")
-    plt.title("Переход решения на Парето-фронте при переоценке")
-
+    plt.xlabel("Mean project duration (days)")
+    plt.ylabel("Mean total idle time (days)")
+    plt.title("Pareto front shift after bias correction")
     plt.legend()
-    plt.grid(True, linestyle='--', alpha=0.5)
-
+    plt.grid(True, linestyle="--", alpha=0.5)
     plt.tight_layout()
     plt.savefig(save_path, dpi=300)
     plt.close()
+    print(f"Saved: {save_path}")
 
-    print(f"График перехода сохранен в {save_path}")
 
-def plot_history_metrics(history, save_prefix="output/plots/history"):
-    import matplotlib.pyplot as plt
+def plot_history_metrics(
+    history: list[dict],
+    save_prefix: str = "output/plots/history",
+) -> None:
+    """
+    Plot the evolution of key replanning metrics across iterative stages.
 
+    Produces three separate figures:
+      - Bias factor (exp θ) per stage.
+      - Chosen planning percentile per stage.
+      - Expected project finish time per stage.
+
+    Args:
+        history:     List of stage dicts with keys ``stage``, ``bias``,
+                     ``percentile``, and ``finish``.
+        save_prefix: Path prefix; ``_bias.png``, ``_percentile.png``,
+                     and ``_finish.png`` are appended automatically.
+    """
     stages = [h["stage"] for h in history]
-    bias = [h["bias"] for h in history]
-    percentile = [h["percentile"] for h in history]
-    finish = [h["finish"] for h in history]
-
-    # --- 1. Смещение ---
-    plt.figure()
-    plt.plot(stages, bias, marker='o')
-    plt.xlabel("Этап")
-    plt.ylabel("Смещение (bias)")
-    plt.title("Динамика смещения")
-    plt.grid(True)
-    plt.savefig(f"{save_prefix}_bias.png", dpi=300)
-    plt.close()
-
-    # --- 2. Percentile ---
-    plt.figure()
-    plt.plot(stages, percentile, marker='o')
-    plt.xlabel("Этап")
-    plt.ylabel("Percentile")
-    plt.title("Динамика процентиля")
-    plt.grid(True)
-    plt.savefig(f"{save_prefix}_percentile.png", dpi=300)
-    plt.close()
-
-    # --- 3. Срок проекта ---
-    plt.figure()
-    plt.plot(stages, finish, marker='o')
-    plt.xlabel("Этап")
-    plt.ylabel("Срок проекта")
-    plt.title("Динамика срока проекта")
-    plt.grid(True)
-    plt.savefig(f"{save_prefix}_finish.png", dpi=300)
-    plt.close()
-
-    print("Графики сохранены")
+    metrics = [
+        ("bias",       "Bias factor (exp θ)",   "Bias dynamics"),
+        ("percentile", "Planning percentile",    "Percentile dynamics"),
+        ("finish",     "Project finish (days)",  "Finish time dynamics"),
+    ]
+    for key, ylabel, title in metrics:
+        values = [h[key] for h in history]
+        plt.figure()
+        plt.plot(stages, values, marker="o")
+        plt.xlabel("Stage")
+        plt.ylabel(ylabel)
+        plt.title(title)
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig(f"{save_prefix}_{key}.png", dpi=300)
+        plt.close()
+    print(f"History plots saved with prefix: {save_prefix}")

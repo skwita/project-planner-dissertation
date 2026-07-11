@@ -1,45 +1,75 @@
+"""Excel export helpers."""
+
 import pandas as pd
 
-def export_schedule_to_excel(tasks, filename, project_duration, idle_time=None):
-    # === Первый лист: План проекта ===
-    data = []
+from models.task import Task
 
-    for task in tasks:
-        data.append({
-            "ID": task.task_id,
-            "Роль": task.role,
-            "Предшественники": ", ".join(map(str, task.dependencies)) if task.dependencies else "",
-            "Ожидаемое ср.время": task.mean,
-            "Абсолютное отклонение": task.stddev,
-            "Запланированное начало":round(task.planned_start_time, 2),
-            "Запланированная длительность":round(task.planned_duration, 2),
-            "Запланированный конец":round(task.planned_end_time, 2),
-            "Фактическое начало":round(task.real_start_time, 2),
-            "Фактическая длительность":round(task.real_duration, 2),
-            "Фактический конец":round(task.real_end_time, 2)
-        })
 
-    df_schedule = pd.DataFrame(data)
-    df_schedule.loc[len(df_schedule.index)] = {
-        "ID": "ИТОГО",
-        "Реальное окончание": round(project_duration, 2)
-    }
+def export_schedule_to_excel(
+    tasks: list[Task],
+    filename: str,
+    project_duration: float,
+    idle_time: dict[str, float] | None = None,
+) -> None:
+    """
+    Write the schedule to an Excel workbook with two sheets:
+      - 'Schedule': one row per task plus a totals row.
+      - 'Idle by role': per-role idle time (omitted when idle_time is None).
 
-    # === Второй лист: Простой по ролям ===
-    if idle_time is not None:
-        idle_data = [{"Роль": role, "Простой (дней)": round(duration, 2)} for role, duration in idle_time.items()]
-        df_idle = pd.DataFrame(idle_data)
-    else:
-        df_idle = pd.DataFrame()
+    Args:
+        tasks:            Scheduled tasks with all time fields set.
+        filename:         Output path (e.g. ``"output/schedule.xlsx"``).
+        project_duration: Real project duration to write in the totals row.
+        idle_time:        Optional dict mapping role → idle days.
+    """
+    schedule_rows = [
+        {
+            "ID": t.task_id,
+            "Role": t.role,
+            "Predecessors": ", ".join(map(str, t.dependencies)) if t.dependencies else "",
+            "Mean duration": t.mean,
+            "Std dev": t.stddev,
+            "Planned start": round(t.planned_start_time, 2),
+            "Planned duration": round(t.planned_duration, 2),
+            "Planned end": round(t.planned_end_time, 2),
+            "Real start": round(t.real_start_time, 2),
+            "Real duration": round(t.real_duration, 2),
+            "Real end": round(t.real_end_time, 2),
+        }
+        for t in tasks
+    ]
+    df_schedule = pd.DataFrame(schedule_rows)
+    # Append totals row
+    totals = {col: "" for col in df_schedule.columns}
+    totals["ID"] = "TOTAL"
+    totals["Real end"] = round(project_duration, 2)
+    df_schedule = pd.concat(
+        [df_schedule, pd.DataFrame([totals])], ignore_index=True
+    )
 
-    # === Запись в Excel с двумя листами ===
+    idle_rows = (
+        [{"Role": role, "Idle (days)": round(days, 2)} for role, days in idle_time.items()]
+        if idle_time else []
+    )
+    df_idle = pd.DataFrame(idle_rows)
+
     with pd.ExcelWriter(filename, engine="openpyxl") as writer:
-        df_schedule.to_excel(writer, index=False, sheet_name="План проекта")
+        df_schedule.to_excel(writer, index=False, sheet_name="Schedule")
         if not df_idle.empty:
-            df_idle.to_excel(writer, index=False, sheet_name="Простой по ролям")
+            df_idle.to_excel(writer, index=False, sheet_name="Idle by role")
 
-def export_percentile_analysis_to_excel(results, output_path):
+
+def export_percentile_analysis_to_excel(results: list[dict], output_path: str) -> pd.DataFrame:
+    """
+    Write percentile analysis results to Excel and return the DataFrame.
+
+    Args:
+        results:     List of result dicts (one per percentile).
+        output_path: Output file path.
+
+    Returns:
+        The resulting DataFrame.
+    """
     df = pd.DataFrame(results)
     df.to_excel(output_path, index=False)
     return df
-

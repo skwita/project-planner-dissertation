@@ -1,882 +1,721 @@
-from collections import defaultdict, deque
-from concurrent import futures
+"""
+Dissertation project planner — main analysis script.
+
+Runs the full pipeline:
+  Part 1.1  Build an averaged Monte Carlo schedule → Gantt + Excel export
+  Part 1.2  Explore the effect of the task percentile on project duration
+  Part 1.3  Estimate the project buffer at a given confidence level
+  Part 1.4  Pareto plot: idle time vs. project duration
+  Part 1.5  Overlay PDF/CDF for a selected set of percentiles
+  Part 1.6  Heatmaps of duration, idle time and buffer
+
+Each function is self-contained and can be called individually.
+"""
+
+from __future__ import annotations
+
 import copy
+from collections import defaultdict
+from concurrent import futures
+from datetime import datetime
+
+import matplotlib
+import matplotlib.pyplot as plt
+import numpy as np
+import seaborn as sns
+from tqdm import tqdm
 
 from services.bayes_rescheduler import reschedule_with_fixed_project_deadline
-from services.critical_path import critical_chain_path, find_critical_path
+from services.critical_path import critical_chain_path
+from services.exporter import export_percentile_analysis_to_excel, export_schedule_to_excel
+from services.metrics import (
+    calculate_buffer,
+    calculate_idle_time,
+    calculate_project_duration,
+    monte_carlo_simulation,
+    parallel_monte_carlo_simulation,
+)
 from services.parser import load_tasks_from_csv
 from services.scheduler import build_schedule
-from services.metrics import calculate_project_duration, calculate_idle_time, monte_carlo_schedules, monte_carlo_simulation, calculate_buffer, parallel_monte_carlo_simulation
-from services.exporter import export_schedule_to_excel, export_percentile_analysis_to_excel
 from visualization.gantt_chart import plot_gantt, plot_replanned_gantt
-from visualization.plot_percentiles_ends_distr import plot_percentile_pdf, plot_percentile_cdfs
-from visualization.plot_idle_vs_duration import plot_idle_vs_duration, plot_history_metrics
-from visualization.plot_idle_vs_duration import plot_pareto_transition
-from datetime import datetime
-from tqdm import tqdm
-import seaborn as sns
-import matplotlib.pyplot as plt
-import matplotlib
-import numpy as np
-import networkx as nx
+from visualization.plot_idle_vs_duration import (
+    plot_idle_vs_duration,
+    plot_history_metrics,
+    plot_pareto_transition,
+)
+from visualization.plot_percentiles_ends_distr import plot_percentile_cdfs, plot_percentile_pdf
 
 matplotlib.use("Agg")
 
-def part1_1_schedule_project(pr_buffer, path="data/tasks.csv", percentile=0.9, export_excel=True, runs=10000):
-    print("______________________________________________________")
-    print(f"part1_1 started at {datetime.now().time()}")
-    print("______________________________________________________")
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _log(label: str) -> None:
+    """Print a section separator with a timestamp."""
+    sep = "_" * 54
+    print(f"\n{sep}\n{label} started at {datetime.now().time()}\n{sep}")
+
+
+# ---------------------------------------------------------------------------
+# Part 1.1 — Schedule project and export
+# ---------------------------------------------------------------------------
+
+def part1_1_schedule_project(
+    pr_buffer: float,
+    path: str = "data/tasks.csv",
+    percentile: float = 0.9,
+    export_excel: bool = True,
+    runs: int = 10_000,
+):
+    """
+    Build a schedule by averaging ``runs`` Monte Carlo simulations.
+
+    The averaged times are used for the Gantt chart and, optionally, the
+    Excel export. This approach smooths out per-run randomness.
+
+    Args:
+        pr_buffer:    Project buffer in days (drawn on the Gantt).
+        path:         Path to the tasks CSV.
+        percentile:   Task planning percentile.
+        export_excel: Whether to write ``output/output_schedule.xlsx``.
+        runs:         Number of MC runs to average.
+
+    Returns:
+        Tuple of (scheduled_tasks, project_duration, idle_time).
+    """
+    _log("Part 1.1")
 
     tasks = load_tasks_from_csv(path)
-
-    aggregated = defaultdict(lambda: defaultdict(list))
+    aggregated: dict[int, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
 
     for run in range(runs):
         tasks_copy = copy.deepcopy(tasks)
         scheduled = build_schedule(tasks_copy, percentile, seed=run)
-
         for task in scheduled:
             aggregated[task.task_id]["planned_start_time"].append(task.planned_start_time)
             aggregated[task.task_id]["planned_end_time"].append(task.planned_end_time)
             aggregated[task.task_id]["real_start_time"].append(task.real_start_time)
             aggregated[task.task_id]["real_end_time"].append(task.real_end_time)
 
+    # Replace individual run values with run averages
     scheduled_tasks = copy.deepcopy(tasks)
     for task in scheduled_tasks:
-        task.planned_start_time = float(np.mean(aggregated[task.task_id]["planned_start_time"]))
-        task.planned_end_time   = float(np.mean(aggregated[task.task_id]["planned_end_time"]))
-        task.real_start_time    = float(np.mean(aggregated[task.task_id]["real_start_time"]))
-        task.real_end_time      = float(np.mean(aggregated[task.task_id]["real_end_time"]))
+        agg = aggregated[task.task_id]
+        task.planned_start_time = float(np.mean(agg["planned_start_time"]))
+        task.planned_end_time   = float(np.mean(agg["planned_end_time"]))
+        task.real_start_time    = float(np.mean(agg["real_start_time"]))
+        task.real_end_time      = float(np.mean(agg["real_end_time"]))
+        task.planned_duration   = task.planned_end_time - task.planned_start_time
+        task.real_duration      = task.real_end_time - task.real_start_time
 
-        # пересчёт длительностей
-        task.planned_duration = task.planned_end_time - task.planned_start_time
-        task.real_duration    = task.real_end_time - task.real_start_time
-
-    # считаем метрики уже на усреднённых задачах
     project_duration = calculate_project_duration(scheduled_tasks)
     idle = calculate_idle_time(scheduled_tasks)
 
-    plot_gantt(scheduled_tasks, f'output/plots/gantt_{percentile}.png', pr_buffer)
+    plot_gantt(scheduled_tasks, f"output/plots/gantt_{percentile}.png", pr_buffer)
 
     if export_excel:
         export_schedule_to_excel(
             scheduled_tasks,
             filename="output/output_schedule.xlsx",
             project_duration=project_duration,
-            idle_time=idle
+            idle_time=idle,
         )
 
     return scheduled_tasks, project_duration, idle
 
-def part1_2_explore_percentile_effect(percentiles, task_file="data/tasks.csv", n_iter=100_000, seed=None):
-    print("______________________________________________________")
-    print(f"part1_2 started at {datetime.now().time()}")
-    print("______________________________________________________")
-    results = []
-    all_durations = {}
-    
-    # параллельный запуск всех симуляций
-    parallel_results = parallel_monte_carlo_simulation(task_file, percentiles, n_iter, seed)
 
-    # собираем все данные
+# ---------------------------------------------------------------------------
+# Part 1.2 — Explore percentile effect
+# ---------------------------------------------------------------------------
+
+def part1_2_explore_percentile_effect(
+    percentiles: list[float],
+    task_file: str = "data/tasks.csv",
+    n_iter: int = 100_000,
+    seed: int | None = None,
+):
+    """
+    Run MC simulations across multiple planning percentiles and export results.
+
+    Saves individual PDF and CDF plots per percentile, plus an Excel summary.
+
+    Args:
+        percentiles: List of task percentiles to evaluate.
+        task_file:   Path to tasks CSV.
+        n_iter:      MC iterations per percentile.
+        seed:        RNG seed.
+
+    Returns:
+        DataFrame with the summary statistics.
+    """
+    _log("Part 1.2")
+
+    parallel_results = parallel_monte_carlo_simulation(task_file, percentiles, n_iter, seed)
+    results = []
+    all_durations: dict[float, np.ndarray] = {}
+
     for p in percentiles:
         durations, idles, _ = parallel_results[p]
         all_durations[p] = durations
 
-        avg_duration = np.mean(durations)
         roles = {role for idle in idles for role in idle}
         avg_idle = {role: np.mean([idle.get(role, 0.0) for idle in idles]) for role in roles}
-        
-        row = {"Процентиль": p, "Среднее время проекта": round(avg_duration, 2)}
-        for role, idle in avg_idle.items():
-            row[f"Простой_{role}"] = round(idle, 2)
+
+        row: dict = {"Percentile": p, "Mean project duration": round(float(np.mean(durations)), 2)}
+        for role, val in avg_idle.items():
+            row[f"Idle_{role}"] = round(val, 2)
         results.append(row)
 
-    # общий диапазон по X (по квантилям, чтобы убрать хвосты)
     all_values = np.concatenate(list(all_durations.values()))
-    xmin, xmax = int(np.min(all_values) - 1), int(np.max(all_values) + 1)
+    xmin, xmax = int(all_values.min() - 1), int(all_values.max() + 1)
 
-    # === ОТДЕЛЬНЫЕ графики PDF и CDF для каждого процентиля ===
     for p, durations in all_durations.items():
-        # PDF
         plot_percentile_pdf(
-            durations_list=[durations],
-            labels=[f"p={p:.2f}"],
+            [durations], [f"p={p:.2f}"],
             filename=f"output/plots/pdf_percentile_{p:.2f}.png",
-            bins=xmax-xmin,
-            xlim=(xmin, xmax)
+            bins=xmax - xmin, xlim=(xmin, xmax),
         )
-        # CDF
         plot_percentile_cdfs(
-            durations_list=[durations],
-            labels=[f"p={p:.2f}"],
+            [durations], [f"p={p:.2f}"],
             filename=f"output/plots/cdf_percentile_{p:.2f}.png",
-            xlim=(xmin, xmax)
+            xlim=(xmin, xmax),
         )
 
-    # экспорт в Excel
-    df = export_percentile_analysis_to_excel(results, "output/percentile_analysis.xlsx")
-    return df
+    return export_percentile_analysis_to_excel(results, "output/percentile_analysis.xlsx")
 
-def part1_3_project_buffer(percentile_tasks=0.5, percentile_project=0.9, task_file="data/tasks.csv", n_iter=1_000, seed=None):
-    """
-    Рассчитывает размер буфера проекта (buffer_90) как:
-    buffer_90 = t90 - плановое время окончания последней задачи.
-    
-    :param percentile_tasks: процентиль длительностей задач для планирования
-    :param task_file: путь к CSV с задачами
-    :param n_iter: количество симуляций
-    :param seed: фиксированное зерно генератора
-    :return: размер буфера в днях
-    """
 
-    # 1. Плановое расписание
+# ---------------------------------------------------------------------------
+# Part 1.3 — Project buffer
+# ---------------------------------------------------------------------------
+
+def part1_3_project_buffer(
+    percentile_tasks: float = 0.5,
+    percentile_project: float = 0.9,
+    task_file: str = "data/tasks.csv",
+    n_iter: int = 1_000,
+    seed: int | None = None,
+) -> float:
+    """
+    Estimate the project buffer at the given confidence level.
+
+    The buffer is defined as the ``percentile_project``-th percentile of
+    schedule overruns relative to the planned project duration.
+
+    Args:
+        percentile_tasks:   Task planning percentile.
+        percentile_project: Confidence level for the buffer (e.g. 90 = 90th %).
+        task_file:          Path to tasks CSV.
+        n_iter:             MC iterations.
+        seed:               RNG seed.
+
+    Returns:
+        Buffer size in days.
+    """
     tasks = load_tasks_from_csv(task_file)
     scheduled_tasks = build_schedule(tasks, percentile=percentile_tasks, seed=seed)
-    # planned_duration = max(task.planned_end_time for task in scheduled_tasks)
+    planned_duration = calculate_project_duration(scheduled_tasks)
 
-    # 2. Моделирование N проектов
     durations, _, _ = monte_carlo_simulation(task_file, percentile_tasks, n_iter, seed, 0)
+    return calculate_buffer(durations, planned_duration, percentile_project)
 
-    # 3. t90 — длительность, в которую укладывается 90% проектов
-    t_n = calculate_buffer(durations, calculate_project_duration(scheduled_tasks),  percentile_project)
 
-    return t_n
+# ---------------------------------------------------------------------------
+# Part 1.4 — Pareto idle vs duration
+# ---------------------------------------------------------------------------
 
-def part1_4_plot_pareto_idle_vs_duration(percentiles_tasks, task_file="data/tasks.csv", seed=None, n_iter=100_000, save_path="output/plots/pareto_idle_duration.png"):
+def part1_4_plot_pareto_idle_vs_duration(
+    percentiles_tasks: list[float],
+    task_file: str = "data/tasks.csv",
+    seed: int | None = None,
+    n_iter: int = 100_000,
+    save_path: str = "output/plots/pareto_idle_duration.png",
+) -> None:
     """
-    Строит график Парето: средняя длительность проекта vs средний суммарный простой
-    при разных перцентилях задач, рассчитанные по результатам Monte Carlo.
+    Build and save the Pareto scatter plot: duration vs. idle time.
 
-    :param percentiles_tasks: список процентилей для длительностей задач (0.1 = 10%)
-    :param task_file: путь к CSV с задачами
-    :param seed: зерно генератора для воспроизводимости
-    :param n_iter: количество итераций Монте-Карло
-    :param save_path: путь для сохранения графика
+    Args:
+        percentiles_tasks: List of task percentiles.
+        task_file:         Path to tasks CSV.
+        seed:              RNG seed.
+        n_iter:            MC iterations per percentile.
+        save_path:         Output image path.
     """
+    _log("Part 1.4")
 
-    print("______________________________________________________")
-    print(f"part1_4 started at {datetime.now().time()}")
-    print("______________________________________________________")
-
-    durations = []
-    idles_sum = []
-    
     parallel_results = parallel_monte_carlo_simulation(task_file, percentiles_tasks, n_iter, seed)
+    durations, idles_sum = [], []
 
     for p in percentiles_tasks:
-        # Прогоняем Монте-Карло
         mc_durations, mc_idles, _ = parallel_results[p]
-        
-        # Средняя длительность
-        avg_duration = np.mean(mc_durations)
-        
-        # Средний суммарный простой
-        avg_idle_sum = np.mean([sum(idle.values()) for idle in mc_idles])
-        
-        durations.append(avg_duration)
-        idles_sum.append(avg_idle_sum)
-    
-    # Построение графика
+        durations.append(float(np.mean(mc_durations)))
+        idles_sum.append(float(np.mean([sum(idle.values()) for idle in mc_idles])))
+
     plot_idle_vs_duration(durations, idles_sum, percentiles_tasks, n_iter, save_path)
 
-def part1_5_multiple_percentiles(percentiles, task_file="data/tasks.csv", seed=None):
-    print("______________________________________________________")
-    print(f"part1_5 started at {datetime.now().time()}")
-    print("______________________________________________________")
 
-    res_dur = []
-    parallel_results = parallel_monte_carlo_simulation(task_file, percentiles, 100_000, seed)
-    for p in percentiles:
-        durations, _, _ = parallel_results[p]
-        res_dur.append(durations)
-    plot_percentile_pdf(res_dur, percentiles, 'output/plots/project_duration_distributions_multiple_percentiles_pdf.png')
-    plot_percentile_cdfs(res_dur, percentiles, 'output/plots/project_duration_distributions_multiple_percentiles_cdf.png')
+# ---------------------------------------------------------------------------
+# Part 1.5 — Overlay multiple percentiles
+# ---------------------------------------------------------------------------
 
-def part1_6_plot_heatmaps(task_percentiles, project_percentiles):
-    print("______________________________________________________")
-    print(f"part1_6 started at {datetime.now().time()}")
-    print("______________________________________________________")
-    part1_6_1_heatmap_durations(task_percentiles=task_percentiles, project_percentiles=project_percentiles)
-    part1_6_2_heatmap_idles(task_percentiles=task_percentiles, project_percentiles=project_percentiles)
-    part1_6_3_heatmap_project_buffer(task_percentiles=task_percentiles, project_percentiles=project_percentiles)
-
-def compute_duration_and_buffer(task_file, t_p, p_p, n_sim, seed):
-    sim_durations, _, _ = monte_carlo_simulation(task_file, t_p, n_sim, seed)
-    pr_buffer = part1_3_project_buffer(t_p, p_p * 100)
-    avg_duration = np.mean(sim_durations)
-    return avg_duration, pr_buffer
-
-def part1_6_1_heatmap_durations(task_file="data/tasks.csv", 
-                                task_percentiles=[0.5, 0.7, 0.9], 
-                                project_percentiles=[0.5, 0.7, 0.9], 
-                                seed=None, n_sim=100):
+def part1_5_multiple_percentiles(
+    percentiles: list[float],
+    task_file: str = "data/tasks.csv",
+    seed: int | None = None,
+) -> None:
     """
-    Тепловая карта длительности проекта в зависимости от процентиля задачи и проектного процентиля.
+    Overlay PDF and CDF curves for a selection of percentiles.
+
+    Args:
+        percentiles: Percentiles to overlay (e.g. [0.1, 0.5, 0.9]).
+        task_file:   Path to tasks CSV.
+        seed:        RNG seed.
     """
-    durations_matrix = np.zeros((len(task_percentiles), len(project_percentiles)))
+    _log("Part 1.5")
 
-    future_to_idx = {}
-    with futures.ProcessPoolExecutor() as executor:
-        for i, t_p in enumerate(task_percentiles):
-            for j, p_p in enumerate(project_percentiles):
-                future = executor.submit(
-                    compute_duration_and_buffer,
-                    task_file, t_p, p_p, n_sim, seed
-                )
-                future_to_idx[future] = (i, j)
+    parallel_results = parallel_monte_carlo_simulation(task_file, percentiles, 1000, seed)
+    all_durations = [parallel_results[p][0] for p in percentiles]
 
-        for future in tqdm(futures.as_completed(future_to_idx), total=len(future_to_idx), desc="Calculating durations"):
-            i, j = future_to_idx[future]
-            avg_duration, pr_buffer, _ = future.result()
-            durations_matrix[i, j] = avg_duration + pr_buffer
+    plot_percentile_pdf(
+        all_durations, percentiles,
+        "output/plots/project_duration_distributions_multiple_percentiles_pdf.png",
+    )
+    plot_percentile_cdfs(
+        all_durations, percentiles,
+        "output/plots/project_duration_distributions_multiple_percentiles_cdf.png",
+    )
 
+
+# ---------------------------------------------------------------------------
+# Part 1.6 — Heatmaps
+# ---------------------------------------------------------------------------
+
+def part1_6_plot_heatmaps(
+    task_percentiles: list[float],
+    project_percentiles: list[float],
+) -> None:
+    """Run all three heatmap analyses."""
+    _log("Part 1.6")
+    _heatmap_durations(task_percentiles, project_percentiles)
+    _heatmap_idles(task_percentiles, project_percentiles)
+    _heatmap_project_buffer(task_percentiles, project_percentiles)
+
+
+# ---- Helper workers (must be module-level for multiprocessing) ----
+
+def _compute_duration_and_buffer(task_file: str, t_p: float, p_p: float,
+                                  n_sim: int, seed: int | None) -> tuple[float, float]:
+    durations, _, _ = monte_carlo_simulation(task_file, t_p, n_sim, seed, 0)
+    buffer = part1_3_project_buffer(t_p, p_p * 100)
+    return float(np.mean(durations)), buffer
+
+
+def _compute_avg_idle(task_file: str, t_p: float,
+                      n_sim: int, seed: int | None) -> float:
+    _, idles, _ = monte_carlo_simulation(task_file, t_p, n_sim, seed, 0)
+    return float(np.mean([sum(idle.values()) for idle in idles]))
+
+
+def _save_heatmap(matrix: np.ndarray, task_percentiles: list[float],
+                  project_percentiles: list[float], title: str, path: str) -> None:
     plt.figure(figsize=(10, 6))
-    ax = sns.heatmap(durations_matrix, 
-                annot=True, fmt=".1f", cmap="mako", 
-                xticklabels=[f"p={p :.2f}" for p in project_percentiles],
-                yticklabels=[f"p={t :.2f}" for t in task_percentiles])
-    ax.invert_yaxis()  # переворачиваем ось Y, чтобы 0-й индекс был снизу
-    plt.xlabel("Процентиль проекта")
-    plt.ylabel("Процентиль задачи")
-    plt.title("Тепловая карта длительности проекта")
+    ax = sns.heatmap(
+        matrix, annot=True, fmt=".1f", cmap="mako",
+        xticklabels=[f"p={p:.2f}" for p in project_percentiles],
+        yticklabels=[f"p={t:.2f}" for t in task_percentiles],
+    )
+    ax.invert_yaxis()
+    plt.xlabel("Project percentile")
+    plt.ylabel("Task percentile")
+    plt.title(title)
     plt.tight_layout()
-    plt.savefig("output/plots/heatmap_durations_with_buffer.png", dpi=300) #TODO
+    plt.savefig(path, dpi=300)
     plt.close()
 
-def compute_avg_idle(task_file, t_p, n_sim, seed):
-    _, idles, _ = monte_carlo_simulation(task_file, t_p, n_sim, seed)
-    amount = 1
-    summ = 0
-    for idle in idles:
-        summ += sum(idle.values())
-        amount += 1
-    avg_idle_sum = summ / amount
-    return avg_idle_sum
 
-def part1_6_2_heatmap_idles(task_file="data/tasks.csv", 
-                                task_percentiles=[0.5, 0.7, 0.9], 
-                                project_percentiles=[0.5, 0.7, 0.9], 
-                                seed=None, n_sim=100):
-    """
-    Тепловая карта трудовых ресурсов проекта в зависимости от процентиля задачи и проектного процентиля.
-    """
-    durations_matrix = np.zeros((len(task_percentiles), len(project_percentiles)))
-
-    future_to_idx = {}
-    with futures.ProcessPoolExecutor() as executor:
-        for i, t_p in enumerate(task_percentiles):
-            for j, p_p in enumerate(project_percentiles):
-                future = executor.submit(
-                    compute_avg_idle,
-                    task_file, t_p, n_sim, seed
-                )
-                future_to_idx[future] = (i, j)
-
-        for future in tqdm(futures.as_completed(future_to_idx), total=len(future_to_idx), desc="Calculating idles"):
-            i, j = future_to_idx[future]
-            avg_idle_sum = future.result()
-            durations_matrix[i, j] = avg_idle_sum
-
-    plt.figure(figsize=(10, 6))
-    ax = sns.heatmap(durations_matrix, 
-                annot=True, fmt=".1f", cmap="mako", 
-                xticklabels=[f"p={p :.2f}" for p in project_percentiles],
-                yticklabels=[f"p={t :.2f}" for t in task_percentiles])
-    ax.invert_yaxis()  # переворачиваем ось Y, чтобы 0-й индекс был снизу
-    plt.xlabel("Процентиль проекта")
-    plt.ylabel("Процентиль задачи")
-    plt.title("Тепловая карта простоев")
-    plt.tight_layout()
-    plt.savefig("output/plots/heatmap_idle.png", dpi=300)
-    plt.close()
-
-def part1_6_3_heatmap_project_buffer(task_file="data/tasks.csv", 
-                                task_percentiles=[0.5, 0.7, 0.9], 
-                                project_percentiles=[0.5, 0.7, 0.9], 
-                                seed=None, n_sim=100):
-    """
-    Тепловая карта буфера проекта в зависимости от процентиля задачи и проектного процентиля.
-    """
-    durations_matrix = np.zeros((len(task_percentiles), len(project_percentiles)))
+def _heatmap_durations(
+    task_file: str = "data/tasks.csv",
+    task_percentiles: list[float] | None = None,
+    project_percentiles: list[float] | None = None,
+    seed: int | None = None,
+    n_sim: int = 100,
+) -> None:
+    task_percentiles = task_percentiles or [0.5, 0.7, 0.9]
+    project_percentiles = project_percentiles or [0.5, 0.7, 0.9]
+    matrix = np.zeros((len(task_percentiles), len(project_percentiles)))
 
     with futures.ProcessPoolExecutor() as executor:
         future_to_idx = {
-            executor.submit(part1_3_project_buffer, percentile_tasks=t_p, percentile_project=p_p * 100): (i, j)
+            executor.submit(_compute_duration_and_buffer, task_file, t_p, p_p, n_sim, seed): (i, j)
             for i, t_p in enumerate(task_percentiles)
             for j, p_p in enumerate(project_percentiles)
         }
+        for future in tqdm(futures.as_completed(future_to_idx),
+                           total=len(future_to_idx), desc="Duration heatmap"):
+            i, j = future_to_idx[future]
+            avg_dur, buffer = future.result()
+            matrix[i, j] = avg_dur + buffer
 
-        for future in tqdm(futures.as_completed(future_to_idx), total=len(future_to_idx), desc="Buffers"):
+    _save_heatmap(matrix, task_percentiles, project_percentiles,
+                  "Heatmap: project duration (with buffer)",
+                  "output/plots/heatmap_durations_with_buffer.png")
+
+
+def _heatmap_idles(
+    task_file: str = "data/tasks.csv",
+    task_percentiles: list[float] | None = None,
+    project_percentiles: list[float] | None = None,
+    seed: int | None = None,
+    n_sim: int = 100,
+) -> None:
+    task_percentiles = task_percentiles or [0.5, 0.7, 0.9]
+    project_percentiles = project_percentiles or [0.5, 0.7, 0.9]
+    matrix = np.zeros((len(task_percentiles), len(project_percentiles)))
+
+    with futures.ProcessPoolExecutor() as executor:
+        future_to_idx = {
+            executor.submit(_compute_avg_idle, task_file, t_p, n_sim, seed): (i, j)
+            for i, t_p in enumerate(task_percentiles)
+            for j, _ in enumerate(project_percentiles)
+        }
+        for future in tqdm(futures.as_completed(future_to_idx),
+                           total=len(future_to_idx), desc="Idle heatmap"):
+            i, j = future_to_idx[future]
+            matrix[i, j] = future.result()
+
+    _save_heatmap(matrix, task_percentiles, project_percentiles,
+                  "Heatmap: idle time",
+                  "output/plots/heatmap_idle.png")
+
+
+def _heatmap_project_buffer(
+    task_file: str = "data/tasks.csv",
+    task_percentiles: list[float] | None = None,
+    project_percentiles: list[float] | None = None,
+    seed: int | None = None,
+    n_sim: int = 100,
+) -> None:
+    task_percentiles = task_percentiles or [0.5, 0.7, 0.9]
+    project_percentiles = project_percentiles or [0.5, 0.7, 0.9]
+    matrix = np.zeros((len(task_percentiles), len(project_percentiles)))
+
+    with futures.ProcessPoolExecutor() as executor:
+        future_to_idx = {
+            executor.submit(part1_3_project_buffer, t_p, p_p * 100): (i, j)
+            for i, t_p in enumerate(task_percentiles)
+            for j, p_p in enumerate(project_percentiles)
+        }
+        for future in tqdm(futures.as_completed(future_to_idx),
+                           total=len(future_to_idx), desc="Buffer heatmap"):
             i, j = future_to_idx[future]
             try:
-                durations_matrix[i, j] = future.result()
-            except Exception as e:
-                durations_matrix[i, j] = np.nan
-                print(f"Ошибка при расчете буфера для ({i}, {j}): {e}")
+                matrix[i, j] = future.result()
+            except Exception as exc:
+                matrix[i, j] = np.nan
+                print(f"  ⚠ Buffer calc failed at ({i}, {j}): {exc}")
 
-    plt.figure(figsize=(10, 6))
-    ax = sns.heatmap(durations_matrix, 
-                annot=True, fmt=".1f", cmap="mako", 
-                xticklabels=[f"p={p :.2f}" for p in project_percentiles],
-                yticklabels=[f"p={t :.2f}" for t in task_percentiles])
-    ax.invert_yaxis()  # переворачиваем ось Y, чтобы 0-й индекс был снизу
-    plt.xlabel("Процентиль проекта")
-    plt.ylabel("Процентиль задачи")
-    plt.title("Тепловая карта буферов проекта")
-    plt.tight_layout()
-    plt.savefig("output/plots/heatmap_buffer.png", dpi=300)
-    plt.close()
-
-def find_critical_path(tasks):
-    """
-    Находит критический путь среди задач Task.
-    Возвращает список task_id в порядке выполнения.
-    """
-    G = nx.DiGraph()
-
-    # Добавляем вершины и длительности
-    for t in tasks:
-        if t.planned_duration is None:
-            if t.planned_start_time is not None and t.planned_end_time is not None:
-                duration = t.planned_end_time - t.planned_start_time
-            else:
-                duration = t.mean  # fallback
-        else:
-            duration = t.planned_duration
-        G.add_node(t.task_id, duration=duration)
-
-    # Добавляем зависимости
-    for t in tasks:
-        for dep in t.dependencies:
-            G.add_edge(dep, t.task_id)
-
-    # Находим критический путь
-    critical_path = nx.dag_longest_path(G, weight='duration')
-    return critical_path
-
-def buffer_penetration_timeline(tasks, project_buffer):
-    """
-    Классический график сгорания буфера (Buffer Fever Chart).
-    X — прогресс проекта (% выполнения),
-    Y — остаток буфера (% неиспользованного).
-    """
-
-    critical_tasks_ids = critical_chain_path(tasks)
-
-    # crit_tasks = []
-    # for t_id in critical_tasks_ids:
-    #     thisTask = None
-    #     for task in tasks:
-    #         if task.task_id == t_id:
-    #             thisTask = task
-    #     crit_tasks.append(thisTask)
-    crit_tasks = critical_tasks_ids
-    crit_tasks.sort(key=lambda t: t.planned_end_time)
-
-    # 3️⃣ Моделируем сгорание буфера
-    total_delay = 0.0
-    buffer_remaining = []
-    times = []
-    delays = []
-
-    for i, task in enumerate(crit_tasks):
-        if i != 0:
-            delays.append(max(0, task.real_end_time - task.planned_end_time) - sum(delays[:i]))
-        else:
-            delays.append(max(0, task.real_end_time - task.planned_end_time))
-
-    buffer_remaining.append(project_buffer)
-    times.append(0)
-    
-    for i, t in enumerate(crit_tasks):
-        plan_end = t.planned_end_time
-        real_end = t.real_end_time
-
-        # Проверка на корректность
-        if plan_end is None or real_end is None:
-            continue
-
-        # Задержка текущей задачи
-        # delay = max(0, real_end - plan_end)
+    _save_heatmap(matrix, task_percentiles, project_percentiles,
+                  "Heatmap: project buffer",
+                  "output/plots/heatmap_buffer.png")
 
 
-        # # Остаток буфера
-        # remaining = max(0, project_buffer - total_delay)
-        # buffer_remaining.append(remaining / project_buffer)
-        # times.append(plan_end)
-
-        buffer_remaining.append(project_buffer)
-        times.append(plan_end)
-        # buffer_remaining.append(project_buffer - delays[i])
-        # times.append(real_end)
-
-        project_buffer -= delays[i]
-
-    # 4️⃣ Визуализация
-    plt.figure(figsize=(10, 5))
-
-    # === 1. Фиксируем верхнюю точку графика ===
-    initial_buffer = buffer_remaining[0]
-
-    # === 2. Нормированный прогресс ===
-    x0 = times[0]
-    x1 = times[-1]
-    progress = [(t - x0) / (x1 - x0) for t in times]
-
-    # === 3. Центральная линия (идеальное сгорание) ===
-    ideal_y = [initial_buffer * (1 - p) for p in progress]
-
-    # === 4. Сигмы ===
-    sigma = initial_buffer / 6  # чтобы ±3σ покрывали высоту буфера
-
-    # === 5. Симметричный веер зон ===
-    green_upper = [initial_buffer * (1 - p) + sigma * p for p in progress]
-    green_lower = [initial_buffer * (1 - p) - sigma * p for p in progress]
-
-    yellow_upper = [initial_buffer * (1 - p) + 2*sigma * p for p in progress]
-    yellow_lower = [initial_buffer * (1 - p) - 2*sigma * p for p in progress]
-
-    red_upper = [initial_buffer * (1 - p) + 3*sigma * p for p in progress]
-    red_lower = [initial_buffer * (1 - p) - 3*sigma * p for p in progress]
-
-    # === 6. Обрезка значений ===
-    # def clamp(v): return max(0, v)
-    # green_upper = [clamp(v) for v in green_upper]
-    # yellow_upper = [clamp(v) for v in yellow_upper]
-    # red_upper = [clamp(v) for v in red_upper]
-
-    # green_lower = [clamp(v) for v in green_lower]
-    # yellow_lower = [clamp(v) for v in yellow_lower]
-    # red_lower = [clamp(v) for v in red_lower]
-
-
-    # --- Окружение границ графика ---
-    y_max = max(buffer_remaining) * 1.1  # или просто initial_buffer * 1.1
-    y_min = 0
-
-    # === Красная зона сверху ===
-    plt.fill_between(
-        times,
-        y_max,
-        yellow_upper,
-        color="green",
-        alpha=0.08
-    )
-
-    # === Красная зона снизу ===
-    plt.fill_between(
-        times,
-        yellow_lower,
-        min(buffer_remaining),
-        color="red",
-        alpha=0.08
-    )
-
-    # === 7. Отрисовка зон ===
-    # plt.fill_between(times, red_lower, red_upper, color="red", alpha=0.10, label="Красная зона (±3σ)")
-    plt.fill_between(times, yellow_lower, yellow_upper, color="yellow", alpha=0.10)
-    # plt.fill_between(times, green_lower, green_upper, color="green", alpha=0.10, label="Зелёная зона (±1σ)")
-
-    plt.plot(times, buffer_remaining, marker=".", color="tab:blue", label="Оставшийся буфер")
-
-    # plt.fill_between(times, 0.7, 1, color="green", alpha=0.1, label="Зелёная зона")
-    # plt.fill_between(times, 0.3, 0.7, color="yellow", alpha=0.1, label="Жёлтая зона")
-    # plt.fill_between(times, 0, 0.3, color="red", alpha=0.1, label="Красная зона")
-
-    for i, t in enumerate(crit_tasks):
-        # plt.text(times[i*2+1], buffer_remaining[i*2+1], f"{t.task_id}", rotation=0, ha='right', fontsize=8)
-        plt.text(times[i], buffer_remaining[i], f"{t.task_id}", rotation=0, ha='right', fontsize=8)
-
-    plt.title("Сгорание буфера проекта (по критическому пути)")
-    plt.xlabel("Плановое время окончания задачи")
-    plt.ylabel("Оставшийся буфер")
-    plt.ylim(min(0,buffer_remaining[-1]), buffer_remaining[0]+buffer_remaining[0]*0.1)
-    plt.grid(alpha=0.3)
-    plt.legend()
-    plt.show()
-    plt.savefig("output/plots/buffer_penetration_timeline.png", dpi=300, bbox_inches="tight")
-
+# ---------------------------------------------------------------------------
+# Part 3 — Bayesian replanning (single snapshot)
+# ---------------------------------------------------------------------------
 
 def part3_bayesian_replanning(
-    task_file="data/tasks.csv",
-    base_percentile=0.80,
-    progress=None,
-    prior_mean=0.0,
-    prior_std=0.30,
-    obs_noise=0.10,
-    export_plot=True
-):
-    print("______________________________________________________")
-    print(f"part3_bayesian_replanning started at {datetime.now().time()}")
-    print("______________________________________________________")
+    task_file: str = "data/tasks.csv",
+    base_percentile: float = 0.80,
+    progress: dict | None = None,
+    prior_mean: float = 0.0,
+    prior_std: float = 0.30,
+    obs_noise: float = 0.10,
+    export_plot: bool = True,
+) -> dict:
+    """
+    Replan the project from the current observed state.
+
+    Uses completed task actuals to estimate a global duration bias via
+    Bayesian conjugate update, then finds the highest planning percentile
+    that keeps the replanned finish within the original deadline.
+
+    Args:
+        task_file:       Path to tasks CSV.
+        base_percentile: Percentile used to build the original baseline plan.
+        progress:        Status dict {task_id: {"status": ..., ...}}.
+                         Defaults to empty (no observations yet).
+        prior_mean:      Prior mean for log-bias θ (0 = no expected bias).
+        prior_std:       Prior std for log-bias θ.
+        obs_noise:       Log-space observation noise.
+        export_plot:     If True, saves a replanned Gantt chart.
+
+    Returns:
+        Result dict from ``reschedule_with_fixed_project_deadline``.
+    """
+    _log("Part 3 — Bayesian replanning")
 
     if progress is None:
         progress = {}
 
-    # 1. Исходный базовый план
+    # Baseline plan to establish the original deadline
     original_tasks = load_tasks_from_csv(task_file)
-    original_tasks = build_schedule(original_tasks, percentile=base_percentile, seed=42)
+    build_schedule(original_tasks, percentile=base_percentile, seed=42)
+    target_finish_time = max(t.planned_end_time for t in original_tasks)
 
-    target_finish_time = max(task.planned_end_time for task in original_tasks)
-
-    # 2. Перепланирование
     tasks_for_replanning = load_tasks_from_csv(task_file)
-
     result = reschedule_with_fixed_project_deadline(
         tasks=tasks_for_replanning,
         progress=progress,
         target_finish_time=target_finish_time,
-        current_time=None,   # будет восстановлено автоматически из completed-задач
+        current_time=None,
         base_percentile=base_percentile,
         prior_mean=prior_mean,
         prior_std=prior_std,
-        obs_noise=obs_noise
+        obs_noise=obs_noise,
     )
 
-    replanned_tasks = result["tasks"]
-
-    print("Использовано завершённых задач:", result["used_observations"])
-    print("Оценка коэффициента смещения:", round(result["bias_factor_mean"], 4))
-    print("Использованный percentile:", round(result["used_percentile"], 4))
-    print("Текущее реконструированное время:", round(result["current_time"], 4))
-    print("Ожидаемый срок проекта:", round(result["project_finish"], 4))
-    print("Дедлайн сохранён:", result["deadline_met"])
-    print("Комментарий:", result["message"])
+    print(f"  Observations used:    {result['used_observations']}")
+    print(f"  Bias factor (exp θ):  {result['bias_factor_mean']:.4f}")
+    print(f"  Chosen percentile:    {result['used_percentile']:.4f}")
+    print(f"  Replanned finish:     {result['project_finish']:.2f}")
+    print(f"  Deadline met:         {result['deadline_met']}")
+    print(f"  Message:              {result['message']}")
 
     if export_plot:
         plot_replanned_gantt(
             original_tasks=original_tasks,
-            replanned_tasks=replanned_tasks,
+            replanned_tasks=result["tasks"],
             filename="output/plots/replanned_gantt.png",
-            target_finish_time=target_finish_time
+            target_finish_time=target_finish_time,
         )
 
     return result
 
+
+# ---------------------------------------------------------------------------
+# Part 4 — Iterative Bayesian replanning
+# ---------------------------------------------------------------------------
+
 def part4_multistage_replanning_iterative(
-    full_progress,
-    task_file="data/tasks.csv",
-    base_percentile=0.8,
-    batch_size=5,
-    prior_mean=0.0,
-    prior_std=0.3,
-    obs_noise=0.1,
-    export_gantts=False
-):
-    print("______________________________________________________")
-    print(f"iterative replanning started at {datetime.now().time()}")
-    print("______________________________________________________")
+    full_progress: dict,
+    task_file: str = "data/tasks.csv",
+    base_percentile: float = 0.8,
+    batch_size: int = 5,
+    prior_mean: float = 0.0,
+    prior_std: float = 0.3,
+    obs_noise: float = 0.1,
+    export_gantts: bool = False,
+) -> list[dict]:
+    """
+    Simulate multi-stage replanning as actuals arrive batch by batch.
 
-    # --- 1. стартовый план ---
+    Tasks are revealed in order of their planned end time.  At each stage,
+    ``batch_size`` additional completed tasks are added to the observed
+    progress and the plan is updated.  The result history can be visualised
+    with ``plot_history_metrics``.
+
+    Args:
+        full_progress:   Complete actual progress dict (all tasks).
+        task_file:       Path to tasks CSV.
+        base_percentile: Percentile for the initial baseline plan.
+        batch_size:      Number of tasks revealed per iteration.
+        prior_mean:      Prior mean for log-bias θ.
+        prior_std:       Prior std for log-bias θ.
+        obs_noise:       Log-space observation noise.
+        export_gantts:   If True, saves a Gantt chart after each stage.
+
+    Returns:
+        List of stage summary dicts with keys: ``stage``, ``completed``,
+        ``bias``, ``percentile``, ``finish``.
+    """
+    _log("Part 4 — Iterative replanning")
+
+    # Initial baseline plan
     current_tasks = load_tasks_from_csv(task_file)
-    current_tasks = build_schedule(current_tasks, percentile=base_percentile, seed=42)
-
+    build_schedule(current_tasks, percentile=base_percentile, seed=42)
     target_finish_time = max(t.planned_end_time for t in current_tasks)
 
-    # порядок поступления факта
-    ordered_task_ids = [
+    ordered_ids = [
         t.task_id for t in sorted(current_tasks, key=lambda x: x.planned_end_time)
     ]
 
-    observed_progress = {}
-    history = []
+    observed_progress: dict = {}
+    history: list[dict] = []
 
-    # --- 2. итерации ---
-    for i in range(0, len(ordered_task_ids), batch_size):
-        batch_ids = ordered_task_ids[i:i+batch_size]
+    for stage_start in range(0, len(ordered_ids), batch_size):
+        stage_num = stage_start // batch_size + 1
+        batch_ids = ordered_ids[stage_start: stage_start + batch_size]
 
-        print(f"\n=== ЭТАП {i//batch_size + 1} ===")
+        # Reveal next batch of actuals
+        for tid in batch_ids:
+            if tid in full_progress:
+                observed_progress[tid] = full_progress[tid]
 
-        # --- добавляем новые факты ---
-        for task_id in batch_ids:
-            if task_id in full_progress:
-                observed_progress[task_id] = full_progress[task_id]
+        print(f"\n=== Stage {stage_num} | observed: {sorted(observed_progress)} ===")
 
-        print("доступные задачи:", sorted(observed_progress.keys()))
-
-        # --- ключевой момент: используем current_tasks ---
         result = reschedule_with_fixed_project_deadline(
-            tasks=current_tasks,   # ← ВАЖНО
+            tasks=current_tasks,   # iterative: pass updated tasks each time
             progress=observed_progress,
             target_finish_time=target_finish_time,
             current_time=None,
             base_percentile=base_percentile,
             prior_mean=prior_mean,
             prior_std=prior_std,
-            obs_noise=obs_noise
+            obs_noise=obs_noise,
         )
+        current_tasks = result["tasks"]   # carry forward the updated plan
 
-        current_tasks = result["tasks"]   # ← ВАЖНО (итеративность)
-
-        print("смещение:", round(result["bias_factor_mean"], 3))
-        print("percentile:", round(result["used_percentile"], 3))
-        print("срок:", round(result["project_finish"], 2))
+        print(f"  Bias:       {result['bias_factor_mean']:.3f}")
+        print(f"  Percentile: {result['used_percentile']:.3f}")
+        print(f"  Finish:     {result['project_finish']:.2f}")
 
         history.append({
-            "stage": i // batch_size + 1,
-            "completed": len(observed_progress),
-            "bias": result["bias_factor_mean"],
+            "stage":      stage_num,
+            "completed":  len(observed_progress),
+            "bias":       result["bias_factor_mean"],
             "percentile": result["used_percentile"],
-            "finish": result["project_finish"]
+            "finish":     result["project_finish"],
         })
 
         if export_gantts:
             plot_replanned_gantt(
                 original_tasks=current_tasks,
                 replanned_tasks=current_tasks,
-                filename=f"output/plots/replanned_stage_{i//batch_size+1}.png",
-                target_finish_time=target_finish_time
+                filename=f"output/plots/replanned_stage_{stage_num}.png",
+                target_finish_time=target_finish_time,
             )
 
     return history
 
-
 if __name__ == "__main__":
-    PERCENTILE_TASK = 0.9
+    PERCENTILE_TASK = 0.74
     PERCENTILE_PROJECT = 0.9
-    PERCENTILES_RANGE = np.arange(0.05, 0.96, 0.05)
-    # PERCENTILES_RANGE = [0.1, 0.5, 0.9]
+    PERCENTILES_RANGE = list(np.arange(0.05, 0.96, 0.05).tolist())
     PERCENTILES_FOR_PLOT = [0.1, 0.5, 0.9]
 
-    # print("______________________________________________________")
-    # print(f"Started at {datetime.now().time()}")
-    # print("______________________________________________________")
-    #
-    # # # Нахождение буфера проекта
-    # pr_buffer = part1_3_project_buffer(percentile_tasks=PERCENTILE_TASK, percentile_project=PERCENTILE_PROJECT * 100)
-    # # print(pr_buffer)
-    # # pr_buffer = 0
-    # # Расчет задач, построение диаграммы Гантта, экспорт таблицы задач
-    # scheduled_tasks, _, _ = part1_1_schedule_project(pr_buffer, percentile=PERCENTILE_TASK)
-    # # Построение графиков кумулятивных функций распределения и плотности вероятности
+    _log("Main")
+
+    # ------------------------------------------------------------------ #
+    # Part 1 — Monte Carlo scheduling analysis                           #
+    # ------------------------------------------------------------------ #
+    # pr_buffer = part1_3_project_buffer(
+    #     percentile_tasks=PERCENTILE_TASK,
+    #     percentile_project=PERCENTILE_PROJECT * 100,
+    # )
+    # part1_1_schedule_project(pr_buffer, percentile=PERCENTILE_TASK)
     # part1_2_explore_percentile_effect(percentiles=PERCENTILES_RANGE)
-    # # Построение Парето графика (Простои-Длительность для разных процентилей задач)
     # part1_4_plot_pareto_idle_vs_duration(PERCENTILES_RANGE)
-    # # Построение графика плотности вероятности с разными процентилями
-    # part1_5_multiple_percentiles(PERCENTILES_FOR_PLOT)
-    # # Тепловые карты по длительности,
-    # part1_6_plot_heatmaps(task_percentiles=PERCENTILES_RANGE, project_percentiles=PERCENTILES_RANGE)
-    #
-    # # buffer_penetration_timeline(scheduled_tasks, pr_buffer)
+    part1_5_multiple_percentiles([0.74])
+    # part1_6_plot_heatmaps(
+    #     task_percentiles=PERCENTILES_RANGE,
+    #     project_percentiles=PERCENTILES_RANGE,
+    # )
 
-    progress_example_long = {
-        1: {"status": "done", "actual_duration": 3.0},
-        2: {"status": "done", "actual_duration": 9.0},
-        3: {"status": "done", "actual_duration": 12.0},
-        4: {"status": "done", "actual_duration": 6.0},
-        5: {"status": "done", "actual_duration": 7.5},
-        6: {"status": "done", "actual_duration": 5.25},
-        7: {"status": "done", "actual_duration": 15.0},
-        8: {"status": "done", "actual_duration": 18.0},
-        9: {"status": "done", "actual_duration": 12.0},
-        10: {"status": "done", "actual_duration": 9.0},
-        19: {"status": "done", "actual_duration": 9.0},
-        21: {"status": "done", "actual_duration": 12.0},
-        11: {"status": "done", "actual_duration": 7.5},
-        20: {"status": "done", "actual_duration": 15.0},
-        12: {"status": "done", "actual_duration": 9.0},
-        13: {"status": "not_started"},
-        14: {"status": "not_started"},
-        15: {"status": "not_started"},
-        16: {"status": "not_started"},
-        17: {"status": "not_started"},
-        22: {"status": "not_started"},
-        18: {"status": "not_started"},
-        23: {"status": "not_started"},
-        24: {"status": "not_started"},
-        25: {"status": "not_started"},
-        29: {"status": "not_started"},
-        26: {"status": "not_started"},
-        27: {"status": "not_started"},
-        28: {"status": "not_started"},
-        31: {"status": "not_started"},
-        30: {"status": "not_started"},
-        32: {"status": "not_started"},
-        33: {"status": "not_started"},
-        34: {"status": "not_started"},
-        35: {"status": "not_started"},
-        37: {"status": "not_started"},
-        36: {"status": "not_started"},
-        38: {"status": "not_started"},
-        39: {"status": "not_started"},
-        40: {"status": "not_started"},
-        41: {"status": "not_started"},
-        42: {"status": "not_started"},
-        43: {"status": "not_started"},
-        44: {"status": "not_started"},
-        45: {"status": "not_started"},
-    }
+    # ------------------------------------------------------------------ #
+    # Progress scenarios for Parts 3 & 4                                 #
+    # Tasks marked "not_started" will be replanned from scratch.         #
+    # ------------------------------------------------------------------ #
 
-    progress_example_short = {
-        1: {"status": "done", "actual_duration": 1.33},
-        2: {"status": "done", "actual_duration": 4.0},
-        3: {"status": "done", "actual_duration": 5.33},
-        4: {"status": "done", "actual_duration": 2.67},
-        5: {"status": "done", "actual_duration": 3.33},
-        6: {"status": "done", "actual_duration": 2.33},
-        7: {"status": "done", "actual_duration": 6.67},
-        8: {"status": "done", "actual_duration": 8.0},
-        9: {"status": "done", "actual_duration": 5.33},
-        10: {"status": "done", "actual_duration": 4.0},
-        11: {"status": "done", "actual_duration": 3.33},
-        12: {"status": "done", "actual_duration": 4.0},
-        19: {"status": "done", "actual_duration": 4},
-        20: {"status": "done", "actual_duration": 6.67},
-        21: {"status": "done", "actual_duration": 5.33},
-        13: {"status": "not_started"},
-        14: {"status": "not_started"},
-        15: {"status": "not_started"},
-        16: {"status": "not_started"},
-        17: {"status": "not_started"},
-        18: {"status": "not_started"},
-        22: {"status": "not_started"},
-        23: {"status": "not_started"},
-        24: {"status": "not_started"},
-        25: {"status": "not_started"},
-        26: {"status": "not_started"},
-        27: {"status": "not_started"},
-        28: {"status": "not_started"},
-        29: {"status": "not_started"},
-        30: {"status": "not_started"},
-        31: {"status": "not_started"},
-        32: {"status": "not_started"},
-        33: {"status": "not_started"},
-        34: {"status": "not_started"},
-        35: {"status": "not_started"},
-        36: {"status": "not_started"},
-        37: {"status": "not_started"},
-        38: {"status": "not_started"},
-        39: {"status": "not_started"},
-        40: {"status": "not_started"},
-        41: {"status": "not_started"},
-        42: {"status": "not_started"},
-        43: {"status": "not_started"},
-        44: {"status": "not_started"},
-        45: {"status": "not_started"},
-    }
+    # Scenario A: tasks run ~50 % over budget (bias ≈ 1.5×)
+    # progress_long = {
+    #     1:  {"status": "done", "actual_duration": 3.0},
+    #     2:  {"status": "done", "actual_duration": 9.0},
+    #     3:  {"status": "done", "actual_duration": 12.0},
+    #     4:  {"status": "done", "actual_duration": 6.0},
+    #     5:  {"status": "done", "actual_duration": 7.5},
+    #     6:  {"status": "done", "actual_duration": 5.25},
+    #     7:  {"status": "done", "actual_duration": 15.0},
+    #     8:  {"status": "done", "actual_duration": 18.0},
+    #     9:  {"status": "done", "actual_duration": 12.0},
+    #     10: {"status": "done", "actual_duration": 9.0},
+    #     11: {"status": "done", "actual_duration": 7.5},
+    #     12: {"status": "done", "actual_duration": 9.0},
+    #     19: {"status": "done", "actual_duration": 9.0},
+    #     20: {"status": "done", "actual_duration": 15.0},
+    #     21: {"status": "done", "actual_duration": 12.0},
+    #     **{tid: {"status": "not_started"} for tid in range(13, 46)
+    #        if tid not in (19, 20, 21)},
+    # }
 
-    progress_example_wave = { # 1.5/0.5
-        1: {"status": "done", "actual_duration": 3.0},
-        2: {"status": "done", "actual_duration": 9.0},
-        3: {"status": "done", "actual_duration": 12.0},
-        4: {"status": "done", "actual_duration": 6.0},
-        5: {"status": "done", "actual_duration": 7.5},
-        6: {"status": "done", "actual_duration": 5.25},
-        7: {"status": "done", "actual_duration": 15.0},
-        8: {"status": "done", "actual_duration": 8.0},
-        9: {"status": "done", "actual_duration": 5.33},
-        10: {"status": "done", "actual_duration": 4.0},
-        11: {"status": "done", "actual_duration": 3.33},
-        12: {"status": "done", "actual_duration": 4.0},
-        13: {"status": "done", "actual_duration": 4.67},
-        14: {"status": "done", "actual_duration": 5.33},
-        15: {"status": "done", "actual_duration": 15.0},
-        16: {"status": "done", "actual_duration": 18.0},
-        17: {"status": "done", "actual_duration": 12.0},
-        18: {"status": "done", "actual_duration": 6.0},
-        19: {"status": "done", "actual_duration": 9.0},
-        20: {"status": "done", "actual_duration": 15.0},
-        21: {"status": "done", "actual_duration": 12.0},
-        22: {"status": "done", "actual_duration": 6.67},
-        23: {"status": "done", "actual_duration": 4.0},
-        24: {"status": "done", "actual_duration": 6.67},
-        25: {"status": "done", "actual_duration": 5.33},
-        26: {"status": "done", "actual_duration": 8.0},
-        27: {"status": "done", "actual_duration": 6.67},
-        28: {"status": "done", "actual_duration": 4.0},
-        29: {"status": "done", "actual_duration": 10.5},
-        30: {"status": "done", "actual_duration": 15.0},
-        31: {"status": "done", "actual_duration": 12.0},
-        32: {"status": "done", "actual_duration": 12.0},
-        33: {"status": "done", "actual_duration": 10.5},
-        34: {"status": "done", "actual_duration": 15.0},
-        35: {"status": "done", "actual_duration": 7.5},
-        36: {"status": "done", "actual_duration": 4.0},
-        37: {"status": "done", "actual_duration": 4.67},
-        38: {"status": "done", "actual_duration": 4.0},
-        39: {"status": "done", "actual_duration": 3.33},
-        40: {"status": "done", "actual_duration": 2.0},
-        41: {"status": "done", "actual_duration": 6.67},
-        42: {"status": "done", "actual_duration": 9.33},
-        43: {"status": "done", "actual_duration": 7.5},
-        44: {"status": "done", "actual_duration": 10.5},
-        45: {"status": "done", "actual_duration": 6.0},
-    }
+    # # Scenario B: tasks run ~33 % under budget (bias ≈ 0.67×)
+    # progress_short = {
+    #     1:  {"status": "done", "actual_duration": 1.33},
+    #     2:  {"status": "done", "actual_duration": 4.0},
+    #     3:  {"status": "done", "actual_duration": 5.33},
+    #     4:  {"status": "done", "actual_duration": 2.67},
+    #     5:  {"status": "done", "actual_duration": 3.33},
+    #     6:  {"status": "done", "actual_duration": 2.33},
+    #     7:  {"status": "done", "actual_duration": 6.67},
+    #     8:  {"status": "done", "actual_duration": 8.0},
+    #     9:  {"status": "done", "actual_duration": 5.33},
+    #     10: {"status": "done", "actual_duration": 4.0},
+    #     11: {"status": "done", "actual_duration": 3.33},
+    #     12: {"status": "done", "actual_duration": 4.0},
+    #     19: {"status": "done", "actual_duration": 4.0},
+    #     20: {"status": "done", "actual_duration": 6.67},
+    #     21: {"status": "done", "actual_duration": 5.33},
+    #     **{tid: {"status": "not_started"} for tid in range(13, 46)
+    #        if tid not in (19, 20, 21)},
+    # }
 
-    progress_example_wave_worse = {
-        1: {"status": "done", "actual_duration": 3.0},
-        2: {"status": "done", "actual_duration": 9.0},
-        3: {"status": "done", "actual_duration": 12.0},
-        4: {"status": "done", "actual_duration": 6.0},
-        5: {"status": "done", "actual_duration": 7.5},
-        6: {"status": "done", "actual_duration": 5.25},
-        7: {"status": "done", "actual_duration": 15.0},
+    # # Scenario C: mixed wave — first half over, second half under budget
+    # progress_wave = {tid: {"status": "done", "actual_duration": dur}
+    #                  for tid, dur in [
+    #     (1, 3.0), (2, 9.0), (3, 12.0), (4, 6.0), (5, 7.5),
+    #     (6, 5.25), (7, 15.0), (8, 8.0), (9, 5.33), (10, 4.0),
+    #     (11, 3.33), (12, 4.0), (13, 4.67), (14, 5.33),
+    #     (15, 15.0), (16, 18.0), (17, 12.0), (18, 6.0),
+    #     (19, 9.0), (20, 15.0), (21, 12.0), (22, 6.67),
+    #     (23, 4.0), (24, 6.67), (25, 5.33), (26, 8.0),
+    #     (27, 6.67), (28, 4.0), (29, 10.5), (30, 15.0),
+    #     (31, 12.0), (32, 12.0), (33, 10.5), (34, 15.0),
+    #     (35, 7.5), (36, 4.0), (37, 4.67), (38, 4.0),
+    #     (39, 3.33), (40, 2.0), (41, 6.67), (42, 9.33),
+    #     (43, 7.5), (44, 10.5), (45, 6.0),
+    # ]}
 
-        8: {"status": "done", "actual_duration": 14.4},
-        9: {"status": "done", "actual_duration": 9.6},
-        10: {"status": "done", "actual_duration": 7.2},
-        11: {"status": "done", "actual_duration": 6.0},
-        12: {"status": "done", "actual_duration": 7.2},
-        13: {"status": "done", "actual_duration": 8.4},
-        14: {"status": "done", "actual_duration": 9.6},
+    # # Scenario D: same wave but second half also over budget
+    # progress_wave_worse = {tid: {"status": "done", "actual_duration": dur}
+    #                        for tid, dur in [
+    #     (1, 3.0), (2, 9.0), (3, 12.0), (4, 6.0), (5, 7.5),
+    #     (6, 5.25), (7, 15.0),
+    #     (8, 14.4), (9, 9.6), (10, 7.2), (11, 6.0), (12, 7.2),
+    #     (13, 8.4), (14, 9.6),
+    #     (15, 15.0), (16, 18.0), (17, 12.0), (18, 6.0),
+    #     (19, 9.0), (20, 15.0), (21, 12.0),
+    #     (22, 12.0), (23, 7.2), (24, 12.0), (25, 9.6),
+    #     (26, 14.4), (27, 12.0), (28, 7.2),
+    #     (29, 10.5), (30, 15.0), (31, 12.0), (32, 12.0),
+    #     (33, 10.5), (34, 15.0), (35, 7.5),
+    #     (36, 7.2), (37, 8.4), (38, 7.2), (39, 6.0), (40, 3.6),
+    #     (41, 12.0), (42, 16.8),
+    #     (43, 7.5), (44, 10.5), (45, 6.0),
+    # ]}
 
-        15: {"status": "done", "actual_duration": 15.0},
-        16: {"status": "done", "actual_duration": 18.0},
-        17: {"status": "done", "actual_duration": 12.0},
-        18: {"status": "done", "actual_duration": 6.0},
-        19: {"status": "done", "actual_duration": 9.0},
-        20: {"status": "done", "actual_duration": 15.0},
-        21: {"status": "done", "actual_duration": 12.0},
+    # # ------------------------------------------------------------------ #
+    # # Part 3 — Single-snapshot Bayesian replanning                       #
+    # # ------------------------------------------------------------------ #
+    # result = part3_bayesian_replanning(
+    #     task_file="data/tasks.csv",
+    #     base_percentile=PERCENTILE_TASK,
+    #     progress=progress_long,
+    #     prior_mean=0.0,
+    #     prior_std=0.30,
+    #     obs_noise=0.10,
+    #     export_plot=True,
+    # )
 
-        22: {"status": "done", "actual_duration": 12.0},
-        23: {"status": "done", "actual_duration": 7.2},
-        24: {"status": "done", "actual_duration": 12.0},
-        25: {"status": "done", "actual_duration": 9.6},
-        26: {"status": "done", "actual_duration": 14.4},
-        27: {"status": "done", "actual_duration": 12.0},
-        28: {"status": "done", "actual_duration": 7.2},
-
-        29: {"status": "done", "actual_duration": 10.5},
-        30: {"status": "done", "actual_duration": 15.0},
-        31: {"status": "done", "actual_duration": 12.0},
-        32: {"status": "done", "actual_duration": 12.0},
-        33: {"status": "done", "actual_duration": 10.5},
-        34: {"status": "done", "actual_duration": 15.0},
-        35: {"status": "done", "actual_duration": 7.5},
-
-        36: {"status": "done", "actual_duration": 7.2},
-        37: {"status": "done", "actual_duration": 8.4},
-        38: {"status": "done", "actual_duration": 7.2},
-        39: {"status": "done", "actual_duration": 6.0},
-        40: {"status": "done", "actual_duration": 3.6},
-        41: {"status": "done", "actual_duration": 12.0},
-        42: {"status": "done", "actual_duration": 16.8},
-
-        43: {"status": "done", "actual_duration": 7.5},
-        44: {"status": "done", "actual_duration": 10.5},
-        45: {"status": "done", "actual_duration": 6.0},
-    }
-
-    result = part3_bayesian_replanning(
-        task_file="data/tasks.csv",
-        base_percentile=PERCENTILE_TASK,
-        progress=progress_example_long,
-        prior_mean=0.0,
-        prior_std=0.30,
-        obs_noise=0.10,
-        export_plot=True
-    )
-
-    history = part4_multistage_replanning_iterative(
-        full_progress=progress_example_wave_worse,
-        task_file="data/tasks.csv",
-        base_percentile=0.9,
-        batch_size=2,
-        prior_mean=0.0,
-        prior_std=0.30,
-        obs_noise=0.10,
-        export_gantts=True
-    )
-
-    plot_history_metrics(history)
+    # # ------------------------------------------------------------------ #
+    # # Part 4 — Iterative replanning across stages                        #
+    # # ------------------------------------------------------------------ #
+    # history = part4_multistage_replanning_iterative(
+    #     full_progress=progress_wave_worse,
+    #     task_file="data/tasks.csv",
+    #     base_percentile=PERCENTILE_TASK,
+    #     batch_size=2,
+    #     prior_mean=0.0,
+    #     prior_std=0.30,
+    #     obs_noise=0.10,
+    #     export_gantts=True,
+    # )
+    # plot_history_metrics(history)
