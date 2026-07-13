@@ -1,0 +1,6 @@
+task_id,role,dependencies,mean,stddev
+1,analyst,,2.0,0.5
+2,analyst,1,3.0,0.75
+3,dev,1,4.0,1.0
+4,dev,"2,3",5.0,1.25
+5,tester,4,2.0,0.5

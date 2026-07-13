@@ -153,6 +153,97 @@ def plot_pareto_transition(
     print(f"Saved: {save_path}")
 
 
+def plot_pareto_shift_trajectory(
+    baseline_durations: list[float],
+    baseline_idles: list[float],
+    points: list[dict],
+    deadline: float,
+    save_path: str,
+) -> None:
+    """
+    Show the deadline-drift / percentile-compensation cycle during
+    iterative replanning, overlaid on the original duration/idle Pareto front.
+
+    ``points`` is the output of ``main.build_pareto_shift_updates``: a
+    single ``"baseline"`` point followed by ``n_updates`` (``"drift"``,
+    ``"compensate"``) pairs, one pair per data reveal. Two segment types
+    are drawn, alternating:
+
+      - **Drift** (orange): as newly observed actuals refine the duration
+        bias, the expected finish time at the *unchanged* base percentile
+        moves away from the deadline — the plan drifts off the original
+        Pareto front, primarily along the duration axis.
+      - **Compensate** (firebrick): the planning percentile is searched to
+        pull the finish time back toward the deadline. Since percentile is
+        exactly the parameter that traces the Pareto front, this move is
+        diagonal — part of the drift is undone, at the cost (or benefit)
+        of changed resource idle time.
+
+    Args:
+        baseline_durations: Mean project duration per percentile (original
+                            sweep, e.g. from ``compute_pareto_idle_duration_curve``).
+        baseline_idles:     Mean total idle time per percentile, parallel
+                            to ``baseline_durations``.
+        points:             Point list from ``build_pareto_shift_updates``;
+                            each dict has ``kind``, ``update``, ``finish``,
+                            ``effort`` and ``percentile``.
+        deadline:           Hard deadline (vertical reference line).
+        save_path:          Output image path.
+    """
+    plt.figure(figsize=(9.5, 7.5))
+
+    bd = np.asarray(baseline_durations, dtype=float)
+    bi = np.asarray(baseline_idles, dtype=float)
+    order = np.argsort(bd)
+    plt.plot(bd[order], bi[order], "o--", color="grey", alpha=0.6,
+             linewidth=1.5, markersize=5, zorder=1,
+             label="Baseline plan (original Pareto front)")
+
+    prev = points[0]
+    plt.scatter([prev["finish"]], [prev["effort"]], color="steelblue", s=120,
+                zorder=5, edgecolors="black", marker="s", label="Baseline point")
+
+    drift_labelled = False
+    compensate_labelled = False
+
+    for pt in points[1:]:
+        x0, y0 = prev["finish"], prev["effort"]
+        x1, y1 = pt["finish"], pt["effort"]
+
+        if pt["kind"] == "drift":
+            plt.annotate("", xy=(x1, y1), xytext=(x0, y0),
+                         arrowprops=dict(arrowstyle="->", color="darkorange", lw=2))
+            plt.scatter([x1], [y1], color="darkorange", s=90, zorder=5,
+                        edgecolors="black", marker="^",
+                        label=None if drift_labelled else "Drift (deadline shift, bias update)")
+            drift_labelled = True
+            plt.text(x1, y1, f" U{pt['update']} drift", fontsize=7,
+                     ha="left", va="center")
+        else:  # compensate
+            plt.annotate("", xy=(x1, y1), xytext=(x0, y0),
+                         arrowprops=dict(arrowstyle="->", color="firebrick", lw=2))
+            plt.scatter([x1], [y1], color="firebrick", s=110, zorder=6,
+                        edgecolors="black", marker="o",
+                        label=None if compensate_labelled else "Compensate (percentile search)")
+            compensate_labelled = True
+            plt.text(x1, y1, f" U{pt['update']}: p={pt['percentile']:.2f}", fontsize=7,
+                     ha="left", va="center", fontweight="bold")
+
+        prev = pt
+
+    plt.axvline(deadline, linestyle="--", color="black", linewidth=1.5, label="Deadline")
+
+    plt.xlabel("Project duration / срок (days)")
+    plt.ylabel("Resource idle time / трудозатраты (days)")
+    plt.title("Pareto front shift: deadline drift vs. percentile compensation")
+    plt.legend(loc="best", fontsize=9)
+    plt.grid(True, linestyle="--", alpha=0.4)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300)
+    plt.close()
+    print(f"Saved: {save_path}")
+
+
 def plot_history_metrics(
     history: list[dict],
     save_prefix: str = "output/plots/history",

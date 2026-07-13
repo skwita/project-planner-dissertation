@@ -25,7 +25,12 @@ import numpy as np
 import seaborn as sns
 from tqdm import tqdm
 
-from services.bayes_rescheduler import reschedule_with_fixed_project_deadline
+from services.bayes_rescheduler import (
+    build_rescheduled_plan,
+    estimate_global_bias_posterior,
+    reconstruct_fact_schedule,
+    reschedule_with_fixed_project_deadline,
+)
 from services.critical_path import critical_chain_path
 from services.exporter import export_percentile_analysis_to_excel, export_schedule_to_excel
 from services.metrics import (
@@ -42,6 +47,7 @@ from visualization.plot_idle_vs_duration import (
     plot_idle_vs_duration,
     plot_history_metrics,
     plot_pareto_transition,
+    plot_pareto_shift_trajectory,
 )
 from visualization.plot_percentiles_ends_distr import plot_percentile_cdfs, plot_percentile_pdf
 
@@ -224,6 +230,42 @@ def part1_3_project_buffer(
 # Part 1.4 — Pareto idle vs duration
 # ---------------------------------------------------------------------------
 
+def compute_pareto_idle_duration_curve(
+    percentiles_tasks: list[float],
+    task_file: str = "data/tasks.csv",
+    seed: int | None = None,
+    n_iter: int = 100_000,
+) -> tuple[list[float], list[float]]:
+    """
+    Compute the raw data behind the duration/idle Pareto curve.
+
+    For each task percentile, runs a Monte Carlo simulation and averages
+    the resulting project duration and total per-role idle time. This is
+    the same data ``part1_4_plot_pareto_idle_vs_duration`` plots; it is
+    exposed separately so other callers (e.g. the Pareto-shift trajectory
+    plot) can reuse it as the "baseline plan" curve.
+
+    Args:
+        percentiles_tasks: List of task percentiles.
+        task_file:         Path to tasks CSV.
+        seed:              RNG seed.
+        n_iter:            MC iterations per percentile.
+
+    Returns:
+        Tuple of (mean_durations, mean_total_idle) — parallel lists, one
+        entry per percentile in ``percentiles_tasks``.
+    """
+    parallel_results = parallel_monte_carlo_simulation(task_file, percentiles_tasks, n_iter, seed)
+    durations, idles_sum = [], []
+
+    for p in percentiles_tasks:
+        mc_durations, mc_idles, _ = parallel_results[p]
+        durations.append(float(np.mean(mc_durations)))
+        idles_sum.append(float(np.mean([sum(idle.values()) for idle in mc_idles])))
+
+    return durations, idles_sum
+
+
 def part1_4_plot_pareto_idle_vs_duration(
     percentiles_tasks: list[float],
     task_file: str = "data/tasks.csv",
@@ -243,13 +285,9 @@ def part1_4_plot_pareto_idle_vs_duration(
     """
     _log("Part 1.4")
 
-    parallel_results = parallel_monte_carlo_simulation(task_file, percentiles_tasks, n_iter, seed)
-    durations, idles_sum = [], []
-
-    for p in percentiles_tasks:
-        mc_durations, mc_idles, _ = parallel_results[p]
-        durations.append(float(np.mean(mc_durations)))
-        idles_sum.append(float(np.mean([sum(idle.values()) for idle in mc_idles])))
+    durations, idles_sum = compute_pareto_idle_duration_curve(
+        percentiles_tasks, task_file, seed, n_iter
+    )
 
     plot_idle_vs_duration(durations, idles_sum, percentiles_tasks, n_iter, save_path)
 
@@ -587,6 +625,238 @@ def part4_multistage_replanning_iterative(
 
     return history
 
+
+# ---------------------------------------------------------------------------
+# Part 5 — Pareto front shift trajectory (deadline drift ↔ percentile compensation)
+# ---------------------------------------------------------------------------
+
+def build_pareto_shift_updates(
+    full_progress: dict,
+    task_file: str = "data/tasks.csv",
+    base_percentile: float = 0.8,
+    n_updates: int = 5,
+    prior_mean: float = 0.0,
+    prior_std: float = 0.3,
+    obs_noise: float = 0.1,
+) -> list[dict]:
+    """
+    Build the (drift, compensate) point pairs behind the Pareto-shift chart.
+
+    Tasks are revealed cumulatively in ``n_updates`` equal shares (default 5
+    → every 20 % of tasks, ordered by planned end time). At each update,
+    two points are computed against the *same* refreshed bias posterior:
+
+      1. **Drift** — the expected finish time at the percentile *currently
+         governing the plan* (the previous update's compensate result, or
+         ``base_percentile`` for the very first update) — unchanged, only
+         the bias estimate is refreshed. As newly observed actuals refine
+         the duration bias, this point moves horizontally away from the
+         previous one (same percentile ⇒ same place on the Pareto front,
+         only the deadline shifts) — this is the "deadline shift caused by
+         refined estimates".
+      2. **Compensate** — the planning percentile is searched (same
+         algorithm as ``reschedule_with_fixed_project_deadline``, anchored
+         at ``base_percentile``) to pull the finish time back toward the
+         original deadline. Because percentile is exactly the parameter
+         that traces the duration/idle Pareto front, this move is
+         diagonal: part of the deadline drift is undone, at the cost (or
+         benefit) of changed resource idle time. The resulting percentile
+         becomes the new "currently governing" percentile for the next
+         update's drift point.
+
+    Note: this function only produces the ``finish`` (duration) coordinate
+    of each point, since that is what the bias/percentile search actually
+    computes. The ``effort`` (idle-time) coordinate is a property of *which
+    percentile* was used, not of this deterministic single replanning —
+    ``part5_pareto_shift_trajectory`` fills it in by mapping each point's
+    percentile onto the baseline duration/idle Pareto curve.
+
+    Args:
+        full_progress:   Complete actual progress dict (all tasks).
+        task_file:       Path to tasks CSV.
+        base_percentile: Percentile for the initial baseline plan and for
+                         each update's drift point.
+        n_updates:       Number of equally-spaced updates (default 5 = every
+                         20 % of tasks revealed).
+        prior_mean:      Prior mean for log-bias θ.
+        prior_std:       Prior std for log-bias θ.
+        obs_noise:       Log-space observation noise.
+
+    Returns:
+        List of point dicts, starting with one ``"baseline"`` point followed
+        by ``n_updates`` ``("drift", "compensate")`` pairs. Each dict has
+        keys ``kind``, ``update`` (0 for baseline, else 1..n_updates),
+        ``finish``, ``percentile``, and ``bias`` (exp of the posterior mean).
+    """
+    tasks = load_tasks_from_csv(task_file)
+    build_schedule(tasks, percentile=base_percentile, seed=42)
+    target_finish_time = max(t.planned_end_time for t in tasks)
+
+    ordered_ids = [
+        t.task_id for t in sorted(tasks, key=lambda x: x.planned_end_time)
+    ]
+    n_tasks = len(ordered_ids)
+
+    points: list[dict] = [{
+        "kind": "baseline",
+        "update": 0,
+        "finish": target_finish_time,
+        "percentile": base_percentile,
+        "bias": 1.0,
+    }]
+
+    current_tasks = copy.deepcopy(tasks)
+    observed_progress: dict = {}
+    prev_percentile = base_percentile
+
+    for k in range(1, n_updates + 1):
+        cutoff = round(n_tasks * k / n_updates)
+        for tid in ordered_ids[:cutoff]:
+            if tid in full_progress:
+                observed_progress[tid] = full_progress[tid]
+
+        print(f"\n=== Update {k}/{n_updates} | observed: {sorted(observed_progress)} ===")
+
+        posterior, used = estimate_global_bias_posterior(
+            current_tasks, observed_progress, prior_mean, prior_std, obs_noise,
+        )
+        _, current_time = reconstruct_fact_schedule(current_tasks, observed_progress)
+
+        # --- 1) Drift point: percentile currently governing the plan
+        #        (prev_percentile — the previous update's compensate result,
+        #        or base_percentile for the very first update), refreshed
+        #        bias. Same percentile as the point we're moving from ⇒
+        #        same height on the baseline curve ⇒ a horizontal move. ---
+        _, drift_finish, _ = build_rescheduled_plan(
+            current_tasks, observed_progress, current_time, prev_percentile, posterior,
+        )
+        print(f"  Drift:      finish={drift_finish:.2f}  bias={np.exp(posterior.mean):.3f}")
+        points.append({
+            "kind": "drift",
+            "update": k,
+            "finish": drift_finish,
+            "percentile": prev_percentile,
+            "bias": float(np.exp(posterior.mean)),
+        })
+
+        # --- 2) Compensate point: search percentile to restore deadline ---
+        result = reschedule_with_fixed_project_deadline(
+            tasks=current_tasks,
+            progress=observed_progress,
+            target_finish_time=target_finish_time,
+            current_time=current_time,
+            base_percentile=base_percentile,
+            prev_percentile=prev_percentile,
+            prior_mean=prior_mean,
+            prior_std=prior_std,
+            obs_noise=obs_noise,
+        )
+        print(f"  Compensate: finish={result['project_finish']:.2f}  "
+              f"percentile={result['used_percentile']:.3f}")
+        points.append({
+            "kind": "compensate",
+            "update": k,
+            "finish": result["project_finish"],
+            "percentile": result["used_percentile"],
+            "bias": result["bias_factor_mean"],
+        })
+
+        current_tasks = result["tasks"]
+        prev_percentile = result["used_percentile"]
+
+    return points
+
+
+def part5_pareto_shift_trajectory(
+    full_progress: dict,
+    task_file: str = "data/tasks.csv",
+    base_percentile: float = 0.8,
+    n_updates: int = 5,
+    baseline_percentiles: list[float] | None = None,
+    baseline_n_iter: int = 20_000,
+    prior_mean: float = 0.0,
+    prior_std: float = 0.3,
+    obs_noise: float = 0.1,
+    seed: int | None = None,
+    save_path: str = "output/plots/pareto_shift_trajectory.png",
+) -> list[dict]:
+    """
+    Plot the Pareto-front shift: deadline drift vs. percentile compensation.
+
+    Two things are drawn on the duration/idle-time plane:
+      - The **baseline** curve — the original Pareto front implied by a
+        percentile sweep at project start (same data as Part 1.4): "where
+        the plan said the project would be."
+      - The **update trajectory** — for each of ``n_updates`` equally-spaced
+        data reveals (see ``build_pareto_shift_updates``), a horizontal
+        drift move (deadline shift from refined bias, percentile held
+        fixed) followed by a diagonal compensate move (percentile search
+        pulling the plan back toward the deadline): "where the project
+        actually is." Each point's idle-time (effort) coordinate is read
+        off the baseline curve at that point's percentile — so a drift
+        point (same percentile as before) keeps the same height, and a
+        compensate point (new percentile) lands back on the curve.
+
+    Args:
+        full_progress:         Complete actual progress dict (see
+                              ``reschedule_with_fixed_project_deadline``).
+        task_file:              Path to tasks CSV.
+        base_percentile:        Percentile for the initial baseline plan.
+        n_updates:               Number of equally-spaced updates (default 5
+                              = every 20 % of tasks revealed).
+        baseline_percentiles:  Percentiles swept for the baseline curve.
+                              Defaults to 0.05..0.95 in steps of 0.05.
+        baseline_n_iter:        MC iterations per percentile for the baseline curve.
+        prior_mean:             Prior mean for log-bias θ.
+        prior_std:              Prior std for log-bias θ.
+        obs_noise:              Log-space observation noise.
+        seed:                   RNG seed for the baseline curve simulation.
+        save_path:              Output image path.
+
+    Returns:
+        The point list from ``build_pareto_shift_updates``.
+    """
+    _log("Part 5 — Pareto shift trajectory")
+
+    baseline_percentiles = baseline_percentiles or list(np.arange(0.05, 0.96, 0.05).tolist())
+    baseline_durations, baseline_idles = compute_pareto_idle_duration_curve(
+        baseline_percentiles, task_file, seed, baseline_n_iter,
+    )
+
+    points = build_pareto_shift_updates(
+        full_progress=full_progress,
+        task_file=task_file,
+        base_percentile=base_percentile,
+        n_updates=n_updates,
+        prior_mean=prior_mean,
+        prior_std=prior_std,
+        obs_noise=obs_noise,
+    )
+
+    # Effort (idle-time) is a property of *which percentile* a point uses,
+    # not of a single deterministic replan — read it off the baseline
+    # curve so drift points (unchanged percentile) sit at a fixed height
+    # and compensate points (new percentile) land back on the curve.
+    pct_arr = np.asarray(baseline_percentiles, dtype=float)
+    idle_arr = np.asarray(baseline_idles, dtype=float)
+    order = np.argsort(pct_arr)
+    for pt in points:
+        pt["effort"] = float(np.interp(pt["percentile"], pct_arr[order], idle_arr[order]))
+
+    original_tasks = load_tasks_from_csv(task_file)
+    build_schedule(original_tasks, percentile=base_percentile, seed=42)
+    deadline = max(t.planned_end_time for t in original_tasks)
+
+    plot_pareto_shift_trajectory(
+        baseline_durations=baseline_durations,
+        baseline_idles=baseline_idles,
+        points=points,
+        deadline=deadline,
+        save_path=save_path,
+    )
+    return points
+
+
 if __name__ == "__main__":
     PERCENTILE_TASK = 0.74
     PERCENTILE_PROJECT = 0.9
@@ -617,25 +887,25 @@ if __name__ == "__main__":
     # ------------------------------------------------------------------ #
 
     # Scenario A: tasks run ~50 % over budget (bias ≈ 1.5×)
-    # progress_long = {
-    #     1:  {"status": "done", "actual_duration": 3.0},
-    #     2:  {"status": "done", "actual_duration": 9.0},
-    #     3:  {"status": "done", "actual_duration": 12.0},
-    #     4:  {"status": "done", "actual_duration": 6.0},
-    #     5:  {"status": "done", "actual_duration": 7.5},
-    #     6:  {"status": "done", "actual_duration": 5.25},
-    #     7:  {"status": "done", "actual_duration": 15.0},
-    #     8:  {"status": "done", "actual_duration": 18.0},
-    #     9:  {"status": "done", "actual_duration": 12.0},
-    #     10: {"status": "done", "actual_duration": 9.0},
-    #     11: {"status": "done", "actual_duration": 7.5},
-    #     12: {"status": "done", "actual_duration": 9.0},
-    #     19: {"status": "done", "actual_duration": 9.0},
-    #     20: {"status": "done", "actual_duration": 15.0},
-    #     21: {"status": "done", "actual_duration": 12.0},
-    #     **{tid: {"status": "not_started"} for tid in range(13, 46)
-    #        if tid not in (19, 20, 21)},
-    # }
+    progress_long = {
+        1:  {"status": "done", "actual_duration": 3.0},
+        2:  {"status": "done", "actual_duration": 9.0},
+        3:  {"status": "done", "actual_duration": 12.0},
+        4:  {"status": "done", "actual_duration": 6.0},
+        5:  {"status": "done", "actual_duration": 7.5},
+        6:  {"status": "done", "actual_duration": 5.25},
+        7:  {"status": "done", "actual_duration": 15.0},
+        8:  {"status": "done", "actual_duration": 18.0},
+        9:  {"status": "done", "actual_duration": 12.0},
+        10: {"status": "done", "actual_duration": 9.0},
+        11: {"status": "done", "actual_duration": 7.5},
+        12: {"status": "done", "actual_duration": 9.0},
+        19: {"status": "done", "actual_duration": 9.0},
+        20: {"status": "done", "actual_duration": 15.0},
+        21: {"status": "done", "actual_duration": 12.0},
+        **{tid: {"status": "not_started"} for tid in range(13, 46)
+           if tid not in (19, 20, 21)},
+    }
 
     # # Scenario B: tasks run ~33 % under budget (bias ≈ 0.67×)
     # progress_short = {
@@ -719,3 +989,50 @@ if __name__ == "__main__":
     #     export_gantts=True,
     # )
     # plot_history_metrics(history)
+
+    # ------------------------------------------------------------------ #
+    # Part 5 — Pareto front shift trajectory: scenario comparison         #
+    # ------------------------------------------------------------------ #
+    _pareto_shift_base_tasks = load_tasks_from_csv("data/tasks.csv")
+
+    def _uniform_bias_progress(factor: float) -> dict:
+        """Every task overruns (or underruns) by the same relative factor."""
+        return {
+            t.task_id: {"status": "done", "actual_duration": round(t.mean * factor, 3)}
+            for t in _pareto_shift_base_tasks
+        }
+
+    pareto_shift_scenarios = {
+        # Uniform 20 % overrun (bias ≈ 1.2×) — spreads the 5 updates out
+        # instead of saturating min_percentile after the first update.
+        "uniform_1_20x": _uniform_bias_progress(1.20),
+        # Uniform 20 % underrun (bias ≈ 0.8×) — mirror case: the project
+        # runs ahead of schedule, so compensation should reclaim slack by
+        # *raising* the percentile instead of lowering it.
+        "uniform_0_80x": _uniform_bias_progress(0.80),
+        # Mild uniform 5 % overrun (bias ≈ 1.05×) — small enough that the
+        # deadline stays reachable throughout without hitting min_percentile.
+        "uniform_1_05x": _uniform_bias_progress(1.05),
+        # Everything on-estimate except task 7, which blows out ~5x — shows
+        # how a single critical-task outlier pulls the *global* bias
+        # estimate (shared across all tasks) once it's revealed.
+        "critical_task_7_overrun": {
+            t.task_id: {
+                "status": "done",
+                "actual_duration": t.mean if t.task_id != 7 else round(t.mean * 5, 3),
+            }
+            for t in _pareto_shift_base_tasks
+        },
+    }
+
+    for _scenario_name, _scenario_progress in pareto_shift_scenarios.items():
+        part5_pareto_shift_trajectory(
+            full_progress=_scenario_progress,
+            task_file="data/tasks.csv",
+            base_percentile=PERCENTILE_TASK,
+            n_updates=5,
+            prior_mean=0.0,
+            prior_std=0.30,
+            obs_noise=0.10,
+            save_path=f"output/plots/pareto_shift_trajectory_{_scenario_name}.png",
+        )

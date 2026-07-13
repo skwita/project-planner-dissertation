@@ -9,3 +9,6 @@ pandas>=2.1
 scipy>=1.11
 seaborn>=0.13
 tqdm>=4.66
+
+# Dev / test
+pytest>=8.0
