@@ -253,7 +253,9 @@ def compute_pareto_idle_duration_curve(
 
     Returns:
         Tuple of (mean_durations, mean_total_idle) — parallel lists, one
-        entry per percentile in ``percentiles_tasks``.
+        entry per percentile in ``percentiles_tasks``. Both are guaranteed
+        monotonic in percentile (duration non-decreasing, idle
+        non-increasing) — see the note below.
     """
     parallel_results = parallel_monte_carlo_simulation(task_file, percentiles_tasks, n_iter, seed)
     durations, idles_sum = [], []
@@ -263,7 +265,55 @@ def compute_pareto_idle_duration_curve(
         durations.append(float(np.mean(mc_durations)))
         idles_sum.append(float(np.mean([sum(idle.values()) for idle in mc_idles])))
 
-    return durations, idles_sum
+    return _enforce_pareto_monotonicity(percentiles_tasks, durations, idles_sum)
+
+
+def _enforce_pareto_monotonicity(
+    percentiles: list[float],
+    durations: list[float],
+    idles: list[float],
+) -> tuple[list[float], list[float]]:
+    """
+    Clip away Monte Carlo noise that violates the curve's known monotonicity.
+
+    Raising the task percentile can only lengthen (or leave unchanged) every
+    task's *planned* duration, and the scheduler combines those with plain
+    ``max`` over dependencies and role queues — so the true relationship is
+    exactly monotonic: project duration is non-decreasing and idle time is
+    non-increasing in percentile. There is no real crossing to find; any
+    local up-then-down wiggle in the raw per-percentile MC averages is pure
+    estimation noise (worse at low ``n_iter``), and since the baseline curve
+    is later plotted sorted *by duration*, that noise can reorder points and
+    render as a spurious spike ("mountain") instead of a clean front.
+
+    This runs a running-extremum pass in percentile order — duration is
+    clamped up to the highest value seen so far, idle is clamped down to the
+    lowest — which removes such wiggles while leaving a true monotonic
+    signal untouched.
+
+    Args:
+        percentiles: Percentile values (any order).
+        durations:   Mean durations, parallel to ``percentiles``.
+        idles:       Mean idle times, parallel to ``percentiles``.
+
+    Returns:
+        ``(durations, idles)`` in the same order as the input, with noise
+        violating monotonicity clipped out.
+    """
+    order = sorted(range(len(percentiles)), key=lambda i: percentiles[i])
+
+    fixed_durations = list(durations)
+    fixed_idles = list(idles)
+    running_max_duration = float("-inf")
+    running_min_idle = float("inf")
+
+    for idx in order:
+        running_max_duration = max(running_max_duration, durations[idx])
+        running_min_idle = min(running_min_idle, idles[idx])
+        fixed_durations[idx] = running_max_duration
+        fixed_idles[idx] = running_min_idle
+
+    return fixed_durations, fixed_idles
 
 
 def part1_4_plot_pareto_idle_vs_duration(
@@ -635,9 +685,11 @@ def build_pareto_shift_updates(
     task_file: str = "data/tasks.csv",
     base_percentile: float = 0.8,
     n_updates: int = 5,
+    batch_fraction: float | None = None,
     prior_mean: float = 0.0,
     prior_std: float = 0.3,
     obs_noise: float = 0.1,
+    deadline_buffer: float = 0.0,
 ) -> list[dict]:
     """
     Build the (drift, compensate) point pairs behind the Pareto-shift chart.
@@ -671,6 +723,23 @@ def build_pareto_shift_updates(
     ``part5_pareto_shift_trajectory`` fills it in by mapping each point's
     percentile onto the baseline duration/idle Pareto curve.
 
+    Important: every update replans from the *original* baseline tasks —
+    only the growing ``observed_progress`` dict and the scalar
+    ``prev_percentile`` carry forward, never the previous update's
+    replanned task list. Chaining replanned tasks forward (as
+    ``part4_multistage_replanning_iterative`` does) lets one update's
+    percentile leak into the next update's "planned_start" floor inside
+    ``reconstruct_fact_schedule`` — a task cannot start before the date
+    its *last* plan said it would, and that date shrinks every time the
+    percentile is lowered to protect the deadline. Once a not-yet-started
+    task is later observed as "done", that stale, artificially early floor
+    gets baked into its reconstructed real timeline as a hard constraint,
+    compounding into spurious extra drift that has nothing to do with new
+    information about the bias — for a perfectly uniform bias, this
+    ratchet effect alone can force the percentile down every update even
+    though the bias estimate itself has already converged. Rebuilding
+    fresh from the untouched baseline each time removes that artifact.
+
     Args:
         full_progress:   Complete actual progress dict (all tasks).
         task_file:       Path to tasks CSV.
@@ -678,19 +747,46 @@ def build_pareto_shift_updates(
                          each update's drift point.
         n_updates:       Number of equally-spaced updates (default 5 = every
                          20 % of tasks revealed).
+        batch_fraction:  Override for how large a task-share each update
+                         reveals. By default each of the ``n_updates``
+                         updates reveals ``1/n_updates`` of the tasks
+                         (cumulatively, so the last update always reveals
+                         everything). Set this explicitly to decouple the
+                         two — e.g. ``n_updates=1, batch_fraction=0.25`` for
+                         a single recalculation triggered by the first 25 %
+                         of tasks completing, rather than by the whole
+                         project finishing.
         prior_mean:      Prior mean for log-bias θ.
         prior_std:       Prior std for log-bias θ.
         obs_noise:       Log-space observation noise.
+        deadline_buffer: Relative project buffer added on top of the
+                         ``base_percentile`` baseline finish (e.g. 0.15 for
+                         a 15 % buffer). A deliberate buffer — not just the
+                         raw base_percentile finish — is what lets a
+                         moderate, genuinely uniform bias get absorbed by a
+                         *single* percentile correction that then holds for
+                         every later update; with zero buffer, meeting the
+                         deadline generally requires planning below the
+                         bias-corrected median, which a purely deterministic
+                         bias (no per-task variance) will keep exceeding,
+                         forcing renewed compensation update after update.
 
     Returns:
         List of point dicts, starting with one ``"baseline"`` point followed
         by ``n_updates`` ``("drift", "compensate")`` pairs. Each dict has
         keys ``kind``, ``update`` (0 for baseline, else 1..n_updates),
-        ``finish``, ``percentile``, and ``bias`` (exp of the posterior mean).
+        ``finish``, ``percentile``, ``bias`` (exp of the posterior mean).
+        Compensate points additionally carry ``median_finish`` and
+        ``median_feasible`` — a diagnostic of whether the (buffered)
+        deadline is achievable at percentile 0.5 (the bias-corrected
+        median) given what's known as of that update. When
+        ``median_feasible`` is False, the compensate percentile is being
+        forced below the median — a bet that, under a purely deterministic
+        bias, can never pay off and will keep demanding further correction.
     """
     tasks = load_tasks_from_csv(task_file)
     build_schedule(tasks, percentile=base_percentile, seed=42)
-    target_finish_time = max(t.planned_end_time for t in tasks)
+    target_finish_time = max(t.planned_end_time for t in tasks) * (1.0 + deadline_buffer)
 
     ordered_ids = [
         t.task_id for t in sorted(tasks, key=lambda x: x.planned_end_time)
@@ -705,22 +801,25 @@ def build_pareto_shift_updates(
         "bias": 1.0,
     }]
 
-    current_tasks = copy.deepcopy(tasks)
     observed_progress: dict = {}
     prev_percentile = base_percentile
 
     for k in range(1, n_updates + 1):
-        cutoff = round(n_tasks * k / n_updates)
+        fraction = batch_fraction * k if batch_fraction is not None else k / n_updates
+        cutoff = round(n_tasks * min(fraction, 1.0))
         for tid in ordered_ids[:cutoff]:
             if tid in full_progress:
                 observed_progress[tid] = full_progress[tid]
 
         print(f"\n=== Update {k}/{n_updates} | observed: {sorted(observed_progress)} ===")
 
+        # Fresh copy of the untouched baseline for every update — see the
+        # "Important" note above for why we must not chain replanned tasks.
+        drift_tasks = copy.deepcopy(tasks)
         posterior, used = estimate_global_bias_posterior(
-            current_tasks, observed_progress, prior_mean, prior_std, obs_noise,
+            drift_tasks, observed_progress, prior_mean, prior_std, obs_noise,
         )
-        _, current_time = reconstruct_fact_schedule(current_tasks, observed_progress)
+        _, current_time = reconstruct_fact_schedule(drift_tasks, observed_progress)
 
         # --- 1) Drift point: percentile currently governing the plan
         #        (prev_percentile — the previous update's compensate result,
@@ -728,7 +827,7 @@ def build_pareto_shift_updates(
         #        bias. Same percentile as the point we're moving from ⇒
         #        same height on the baseline curve ⇒ a horizontal move. ---
         _, drift_finish, _ = build_rescheduled_plan(
-            current_tasks, observed_progress, current_time, prev_percentile, posterior,
+            drift_tasks, observed_progress, current_time, prev_percentile, posterior,
         )
         print(f"  Drift:      finish={drift_finish:.2f}  bias={np.exp(posterior.mean):.3f}")
         points.append({
@@ -739,12 +838,27 @@ def build_pareto_shift_updates(
             "bias": float(np.exp(posterior.mean)),
         })
 
+        # --- Diagnostic: is the (buffered) deadline achievable at the
+        #     bias-corrected median? build_rescheduled_plan deep-copies its
+        #     `tasks` argument internally, so reusing `drift_tasks` here is
+        #     safe. See the "median_feasible" note in the docstring. ---
+        _, median_finish, _ = build_rescheduled_plan(
+            drift_tasks, observed_progress, current_time, 0.5, posterior,
+        )
+        median_feasible = median_finish <= target_finish_time
+        print(f"  Median check: finish={median_finish:.2f}  "
+              f"feasible={median_feasible}")
+
         # --- 2) Compensate point: search percentile to restore deadline ---
+        # Another fresh baseline copy — reschedule_with_fixed_project_deadline
+        # reconstructs current_time internally from `compensate_tasks` +
+        # observed_progress when current_time=None.
+        compensate_tasks = copy.deepcopy(tasks)
         result = reschedule_with_fixed_project_deadline(
-            tasks=current_tasks,
+            tasks=compensate_tasks,
             progress=observed_progress,
             target_finish_time=target_finish_time,
-            current_time=current_time,
+            current_time=None,
             base_percentile=base_percentile,
             prev_percentile=prev_percentile,
             prior_mean=prior_mean,
@@ -759,9 +873,10 @@ def build_pareto_shift_updates(
             "finish": result["project_finish"],
             "percentile": result["used_percentile"],
             "bias": result["bias_factor_mean"],
+            "median_finish": median_finish,
+            "median_feasible": median_feasible,
         })
 
-        current_tasks = result["tasks"]
         prev_percentile = result["used_percentile"]
 
     return points
@@ -772,13 +887,16 @@ def part5_pareto_shift_trajectory(
     task_file: str = "data/tasks.csv",
     base_percentile: float = 0.8,
     n_updates: int = 5,
+    batch_fraction: float | None = None,
     baseline_percentiles: list[float] | None = None,
     baseline_n_iter: int = 20_000,
     prior_mean: float = 0.0,
     prior_std: float = 0.3,
     obs_noise: float = 0.1,
+    deadline_buffer: float = 0.0,
     seed: int | None = None,
     save_path: str = "output/plots/pareto_shift_trajectory.png",
+    show: bool = False,
 ) -> list[dict]:
     """
     Plot the Pareto-front shift: deadline drift vs. percentile compensation.
@@ -795,7 +913,7 @@ def part5_pareto_shift_trajectory(
         actually is." Each point's idle-time (effort) coordinate is read
         off the baseline curve at that point's percentile — so a drift
         point (same percentile as before) keeps the same height, and a
-        compensate point (new percentile) lands back on the curve.
+        compensation point (new percentile) lands back on the curve.
 
     Args:
         full_progress:         Complete actual progress dict (see
@@ -804,14 +922,25 @@ def part5_pareto_shift_trajectory(
         base_percentile:        Percentile for the initial baseline plan.
         n_updates:               Number of equally-spaced updates (default 5
                               = every 20 % of tasks revealed).
+        batch_fraction:          Override for how large a task-share each
+                              update reveals — see
+                              ``build_pareto_shift_updates``.
         baseline_percentiles:  Percentiles swept for the baseline curve.
                               Defaults to 0.05..0.95 in steps of 0.05.
         baseline_n_iter:        MC iterations per percentile for the baseline curve.
         prior_mean:             Prior mean for log-bias θ.
         prior_std:              Prior std for log-bias θ.
         obs_noise:              Log-space observation noise.
+        deadline_buffer:        Relative project buffer added on top of the
+                              ``base_percentile`` baseline finish before
+                              searching for a compensating percentile — see
+                              ``build_pareto_shift_updates`` for why this
+                              matters for whether the trajectory can settle.
         seed:                   RNG seed for the baseline curve simulation.
         save_path:              Output image path.
+        show:                   If True, also open the chart in an
+                              interactive window and block until it's
+                              closed (see ``plot_pareto_shift_trajectory``).
 
     Returns:
         The point list from ``build_pareto_shift_updates``.
@@ -828,9 +957,11 @@ def part5_pareto_shift_trajectory(
         task_file=task_file,
         base_percentile=base_percentile,
         n_updates=n_updates,
+        batch_fraction=batch_fraction,
         prior_mean=prior_mean,
         prior_std=prior_std,
         obs_noise=obs_noise,
+        deadline_buffer=deadline_buffer,
     )
 
     # Effort (idle-time) is a property of *which percentile* a point uses,
@@ -845,7 +976,7 @@ def part5_pareto_shift_trajectory(
 
     original_tasks = load_tasks_from_csv(task_file)
     build_schedule(original_tasks, percentile=base_percentile, seed=42)
-    deadline = max(t.planned_end_time for t in original_tasks)
+    deadline = max(t.planned_end_time for t in original_tasks) * (1.0 + deadline_buffer)
 
     plot_pareto_shift_trajectory(
         baseline_durations=baseline_durations,
@@ -853,6 +984,7 @@ def part5_pareto_shift_trajectory(
         points=points,
         deadline=deadline,
         save_path=save_path,
+        show=show,
     )
     return points
 
@@ -1005,34 +1137,74 @@ if __name__ == "__main__":
     pareto_shift_scenarios = {
         # Uniform 20 % overrun (bias ≈ 1.2×) — spreads the 5 updates out
         # instead of saturating min_percentile after the first update.
-        "uniform_1_20x": _uniform_bias_progress(1.20),
+        # With no deadline buffer, the deadline is unreachable even at the
+        # bias-corrected median, so this keeps drifting (see
+        # median_feasible on the compensate points).
+        "uniform_1_20x": {"progress": _uniform_bias_progress(1.20), "deadline_buffer": 0.0},
         # Uniform 20 % underrun (bias ≈ 0.8×) — mirror case: the project
         # runs ahead of schedule, so compensation should reclaim slack by
         # *raising* the percentile instead of lowering it.
-        "uniform_0_80x": _uniform_bias_progress(0.80),
+        "uniform_0_80x": {"progress": _uniform_bias_progress(0.80), "deadline_buffer": 0.0},
         # Mild uniform 5 % overrun (bias ≈ 1.05×) — small enough that the
         # deadline stays reachable throughout without hitting min_percentile.
-        "uniform_1_05x": _uniform_bias_progress(1.05),
+        "uniform_1_05x": {"progress": _uniform_bias_progress(1.05), "deadline_buffer": 0.0},
         # Everything on-estimate except task 7, which blows out ~5x — shows
         # how a single critical-task outlier pulls the *global* bias
         # estimate (shared across all tasks) once it's revealed.
         "critical_task_7_overrun": {
-            t.task_id: {
-                "status": "done",
-                "actual_duration": t.mean if t.task_id != 7 else round(t.mean * 5, 3),
-            }
-            for t in _pareto_shift_base_tasks
+            "progress": {
+                t.task_id: {
+                    "status": "done",
+                    "actual_duration": t.mean if t.task_id != 7 else round(t.mean * 5, 3),
+                }
+                for t in _pareto_shift_base_tasks
+            },
+            "deadline_buffer": 0.0,
+        },
+        # Underrun calibrated so max_percentile (0.99) already satisfies the
+        # deadline from update 1 onward — a genuine boundary (not an
+        # interior equilibrium), so it's robustly stable across all 5
+        # updates with no buffer needed.
+        "underrun_ceiling_stable": {
+            "progress": _uniform_bias_progress(0.57723), "deadline_buffer": 0.0,
+        },
+        # Overrun (bias ≈ 1.22, calibrated so the *estimated* posterior
+        # bias — which runs ~3% above the raw multiplier due to the
+        # mean/median mismatch — lands there) combined with a 15 % project
+        # buffer: the classic CCPM answer to case "uniform_1_20x" above.
+        # Absorbs a moderate overrun within the first couple of updates and
+        # then holds at base_percentile — the deadline stays met throughout.
+        "overrun_buffered_stable": {
+            "progress": _uniform_bias_progress(1.2172), "deadline_buffer": 0.15,
+        },
+        # A single recalculation, triggered once the first 25 % of tasks
+        # complete — just one drift/compensate pair, not an iterative
+        # series. Overrun (bias 1.2×) pushes the compensate point *up*
+        # (idle time increases — percentile has to drop to protect the
+        # deadline).
+        "single_recalc_overrun": {
+            "progress": _uniform_bias_progress(1.20), "deadline_buffer": 0.0,
+            "n_updates": 1, "batch_fraction": 0.25,
+        },
+        # Mirror case: underrun (bias 0.7×) pushes the compensate point
+        # *down* (idle time decreases — percentile rises to reclaim slack).
+        "single_recalc_underrun": {
+            "progress": _uniform_bias_progress(0.70), "deadline_buffer": 0.0,
+            "n_updates": 1, "batch_fraction": 0.25,
         },
     }
 
-    for _scenario_name, _scenario_progress in pareto_shift_scenarios.items():
+    for _scenario_name, _scenario_cfg in pareto_shift_scenarios.items():
         part5_pareto_shift_trajectory(
-            full_progress=_scenario_progress,
+            full_progress=_scenario_cfg["progress"],
             task_file="data/tasks.csv",
             base_percentile=PERCENTILE_TASK,
-            n_updates=5,
+            n_updates=_scenario_cfg.get("n_updates", 5),
+            batch_fraction=_scenario_cfg.get("batch_fraction"),
             prior_mean=0.0,
             prior_std=0.30,
             obs_noise=0.10,
+            deadline_buffer=_scenario_cfg["deadline_buffer"],
             save_path=f"output/plots/pareto_shift_trajectory_{_scenario_name}.png",
+            show=True,  # opens a window per scenario; close it to move to the next
         )

@@ -1,5 +1,6 @@
 """Pareto scatter plot: average project duration vs. average idle time."""
 
+import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
 from scipy.optimize import curve_fit
@@ -159,6 +160,7 @@ def plot_pareto_shift_trajectory(
     points: list[dict],
     deadline: float,
     save_path: str,
+    show: bool = False,
 ) -> None:
     """
     Show the deadline-drift / percentile-compensation cycle during
@@ -179,6 +181,19 @@ def plot_pareto_shift_trajectory(
         diagonal — part of the drift is undone, at the cost (or benefit)
         of changed resource idle time.
 
+    If a compensate point carries a ``median_feasible`` flag (see
+    ``build_pareto_shift_updates``), its marker edge is colour-coded:
+    green when the deadline is still achievable at the bias-corrected
+    median (a genuine, sustainable correction), red when it isn't (the
+    percentile is being forced below the median — a bet that a purely
+    deterministic bias will never pay off, foreshadowing further drift).
+
+    Point labels are offset in screen space (not data space) and staggered
+    by update parity so that clustered points — common once the trajectory
+    settles near the deadline — don't render one on top of another; each
+    label also gets a translucent white backing so it stays legible over
+    the arrows and other markers.
+
     Args:
         baseline_durations: Mean project duration per percentile (original
                             sweep, e.g. from ``compute_pareto_idle_duration_curve``).
@@ -186,11 +201,21 @@ def plot_pareto_shift_trajectory(
                             to ``baseline_durations``.
         points:             Point list from ``build_pareto_shift_updates``;
                             each dict has ``kind``, ``update``, ``finish``,
-                            ``effort`` and ``percentile``.
+                            ``effort`` and ``percentile``. Compensate points
+                            may additionally carry ``median_feasible``.
         deadline:           Hard deadline (vertical reference line).
         save_path:          Output image path.
+        show:               If True, also open the figure in an interactive
+                            window (switches off the ``Agg`` backend for
+                            this call if needed) and block until it's closed.
     """
-    plt.figure(figsize=(9.5, 7.5))
+    # Switch to an interactive backend *before* the figure is created — once
+    # a figure exists under a non-GUI backend like Agg, switching later
+    # won't give it a window to draw into.
+    if show and matplotlib.get_backend().lower() == "agg":
+        plt.switch_backend("TkAgg")
+
+    plt.figure(figsize=(11, 8.5))
 
     bd = np.asarray(baseline_durations, dtype=float)
     bi = np.asarray(baseline_idles, dtype=float)
@@ -202,6 +227,29 @@ def plot_pareto_shift_trajectory(
     prev = points[0]
     plt.scatter([prev["finish"]], [prev["effort"]], color="steelblue", s=120,
                 zorder=5, edgecolors="black", marker="s", label="Baseline point")
+
+    label_bbox = dict(boxstyle="round,pad=0.15", facecolor="white",
+                       edgecolor="none", alpha=0.82)
+    leader_line = dict(arrowstyle="-", color="0.45", lw=0.6, alpha=0.7,
+                        shrinkA=0, shrinkB=3)
+    # Once a trajectory settles, several consecutive points can land almost
+    # on top of each other (e.g. a percentile pinned at a boundary for
+    # several updates). A simple up/down alternation isn't enough to keep
+    # their labels apart, so cycle through a ring of offset directions —
+    # one new slot per label placed, expanding the ring radius every full
+    # lap — and draw a thin leader line from each label back to its point.
+    _label_slots = [
+        (12, 0), (12, 24), (-12, 24), (-70, 0), (-70, -24), (12, -24),
+        (12, 48), (-90, 48), (-90, -48), (12, -48),
+    ]
+    label_counter = 0
+
+    def _next_offset() -> tuple[float, float]:
+        nonlocal label_counter
+        dx, dy = _label_slots[label_counter % len(_label_slots)]
+        lap = label_counter // len(_label_slots)
+        label_counter += 1
+        return dx * (1 + 0.6 * lap), dy * (1 + 0.6 * lap)
 
     drift_labelled = False
     compensate_labelled = False
@@ -217,17 +265,28 @@ def plot_pareto_shift_trajectory(
                         edgecolors="black", marker="^",
                         label=None if drift_labelled else "Drift (deadline shift, bias update)")
             drift_labelled = True
-            plt.text(x1, y1, f" U{pt['update']} drift", fontsize=7,
-                     ha="left", va="center")
+            plt.annotate(f"U{pt['update']} drift", xy=(x1, y1),
+                         xytext=_next_offset(), textcoords="offset points",
+                         fontsize=7, ha="left", va="center", bbox=label_bbox,
+                         arrowprops=leader_line)
         else:  # compensate
             plt.annotate("", xy=(x1, y1), xytext=(x0, y0),
                          arrowprops=dict(arrowstyle="->", color="firebrick", lw=2))
+            median_feasible = pt.get("median_feasible")
+            edge_color = (
+                "black" if median_feasible is None
+                else ("seagreen" if median_feasible else "red")
+            )
+            edge_width = 1.0 if median_feasible is None else 2.5
             plt.scatter([x1], [y1], color="firebrick", s=110, zorder=6,
-                        edgecolors="black", marker="o",
+                        edgecolors=edge_color, linewidths=edge_width, marker="o",
                         label=None if compensate_labelled else "Compensate (percentile search)")
             compensate_labelled = True
-            plt.text(x1, y1, f" U{pt['update']}: p={pt['percentile']:.2f}", fontsize=7,
-                     ha="left", va="center", fontweight="bold")
+            flag = "" if median_feasible is None else (" ✓med" if median_feasible else " ✗med")
+            plt.annotate(f"U{pt['update']}: p={pt['percentile']:.2f}{flag}", xy=(x1, y1),
+                         xytext=_next_offset(), textcoords="offset points",
+                         fontsize=7, ha="left", va="center", fontweight="bold",
+                         bbox=label_bbox, arrowprops=leader_line)
 
         prev = pt
 
@@ -238,10 +297,16 @@ def plot_pareto_shift_trajectory(
     plt.title("Pareto front shift: deadline drift vs. percentile compensation")
     plt.legend(loc="best", fontsize=9)
     plt.grid(True, linestyle="--", alpha=0.4)
+    # Extra vertical breathing room so labels fanned out below a clustered
+    # point don't collide with the x-axis title.
+    plt.margins(y=0.18)
     plt.tight_layout()
     plt.savefig(save_path, dpi=300)
-    plt.close()
     print(f"Saved: {save_path}")
+
+    if show:
+        plt.show()
+    plt.close()
 
 
 def plot_history_metrics(
